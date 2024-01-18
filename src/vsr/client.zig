@@ -245,7 +245,7 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
 
                     const root = &inflight.queue.root;
                     if (inflight.operation.cast(StateMachine) != operation) continue;
-                    if (root.body_total + request.body.len > constants.message_size_max) continue;
+                    if (root.body_total + request.body.len > constants.message_body_size_max) continue;
 
                     // Set the new offset to be at the end of the current inflight's Message body.
                     request.queue = .{
@@ -269,10 +269,9 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
                 },
             };
 
+            const was_empty = self.request_queue.empty();
             self.request_queue.push(request);
-            if (self.request_queue.peek() == request) {
-                self.send_request_for_the_first_time(request);
-            }
+            if (was_empty) self.send_request_for_the_first_time(request);
         }
         
         fn on_eviction(self: *Self, eviction: *const Message.Eviction) void {
@@ -401,22 +400,22 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
                 return;
             }
 
+            // Push the root as first to its batched list to keep demux processing simpler.
+            // Use a copy of `batched` list as `inflight` is invalidated on the first callback.
+            var batched = inflight.queue.root.batched;
+            batched.push_front(inflight);
+            inflight.queue = .{
+                .link = .{
+                    .body_offset = 0,
+                },
+            };
+
             assert(!inflight.operation.vsr_reserved());
             switch (inflight.operation.cast(StateMachine)) {
                 inline else => |operation| {
                     var demuxer = StateMachine.DemuxerType(operation).init(
                         std.mem.bytesAsSlice(StateMachine.Result(operation), reply.body()),
                     );
-
-                    // Push the root as first to its batched list to keep demux processing simpler.
-                    // Use a copy of `batched` as the Request is invalidated on its last callback.
-                    var batched = inflight.queue.root.batched;
-                    batched.push_front(inflight);
-                    inflight.queue = .{
-                        .link = .{
-                            .body_offset = 0,
-                        },
-                    };
 
                     while (batched.pop()) |request| {
                         assert(request.callback != null);
@@ -560,6 +559,7 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
         fn send_request_for_the_first_time(self: *Self, request: *Request) void {
             assert(self.request_queue.peek() == request);
 
+            // Reuse the single message allocated on init for the current inflight request.
             const message = self.message_inflight;
             message.header.* = .{
                 .client = self.id,
@@ -575,6 +575,7 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
             self.request_number += 1;
 
             // First, copy the root Request's body into the message.
+            assert(request.body.len > 0 or request.operation == .register);
             message.header.size += @intCast(request.body.len);
             stdx.copy_disjoint(.exact, u8, message.body(), request.body);
 
@@ -584,16 +585,15 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
                 it = batched.next;
 
                 const body_offset = batched.queue.link.body_offset;
-                assert(message.body().len == body_offset);
+                assert(body_offset == message.body().len);
 
                 message.header.size += @intCast(batched.body.len);
                 assert(message.header.size <= constants.message_size_max);
-
                 stdx.copy_disjoint(.exact, u8, message.body()[body_offset..], batched.body);
             }
 
-            assert(message.header.size <= constants.message_size_max);
             assert(message.body().len == request.queue.root.body_total);
+            assert(message.header.size <= constants.message_size_max);
 
             log.debug("{}: request: request={} size={} {s}", .{
                 self.id,
@@ -821,8 +821,10 @@ test "Client Batching" {
                 .operation = message.header.operation,
             };
 
+            // Zero out the body and compute the checksum.
             @memset(reply.body(), 0);
             reply.header.set_checksum_body(reply.body());
+
             // See Replica.send_reply_message_to_client() why checksum is computed twice.
             reply.header.context = reply.header.calculate_checksum();
             reply.header.set_checksum();
@@ -857,12 +859,14 @@ test "Client Batching" {
             user_id: u128,
         };
 
-        fn submit(self: *@This(), comptime submission: struct {
+        const Submission = struct {
             operation: StateMachine.Operation,
             event_count: usize,
             user_id: u128,
             requests_created: u32,
-        }) !void {
+        };
+
+        fn submit(self: *@This(), comptime submission: Submission) !void {
             const events = switch (submission.operation) {
                 inline else => |operation| blk: {
                     const event_size = @sizeOf(Event(operation));
@@ -902,7 +906,7 @@ test "Client Batching" {
                 callback,
                 &request.vsr_request,
                 submission.operation,
-                events,
+                std.mem.sliceAsBytes(events[0..submission.event_count]),
             );
 
             self.requests_created += submission.requests_created;
@@ -961,7 +965,7 @@ test "Client Batching" {
     });
 
     // Another new request with an op that's NOT batchable.
-    // Ensure this creates a NEW request, not batched with previous .sreial that had extra room.
+    // Ensure this creates a NEW request, not batched with previous .serial that had extra room.
     last_user_id += 1;
     try ctx.submit(.{
         .operation = .serial,
