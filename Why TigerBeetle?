@@ -56,6 +56,11 @@ https://github.com/tigerbeetle/tigerbeetle/blob/IronBeetle/Why%20TigerBeetle%3F
   38: Implemented by Replicated State Machine: 37, 4, 6
   39: Hash chaining: 3, 5
   40: Prepare pipelining: 23
+  41: Disks fail: just a fact of reality
+  42: Tolerance for disk failures: 41, 2
+  43: Any read from disk can return "wrong" data: 41
+  44: Every disk read is guarded by a checksum: 43
+  45: No distinction between successful and failed disk operations: 44
 
 
 State-based representation:
