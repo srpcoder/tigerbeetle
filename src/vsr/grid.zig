@@ -66,6 +66,12 @@ pub fn GridType(comptime Storage: type) type {
             next: ?*Write = null,
         };
 
+        pub const FatWrite = struct {
+            write: Grid.Write = undefined,
+            target: *anyopaque = undefined,
+            hack: usize = 0,
+        };
+
         const WriteIOP = struct {
             grid: *Grid,
             completion: Storage.Write,
@@ -108,6 +114,12 @@ pub fn GridType(comptime Storage: type) type {
 
             /// Link for Grid.read_queue/Grid.read_global_queue linked lists.
             next: ?*Read = null,
+        };
+
+        pub const FatRead = struct {
+            read: Grid.Read = undefined,
+            target: *anyopaque = undefined,
+            hack: usize = 0,
         };
 
         /// Although we distinguish between the reasons why the block is invalid, we only use this
@@ -501,7 +513,7 @@ pub fn GridType(comptime Storage: type) type {
             assert(grid.writing(address, null) != .create);
             // It's safe to release an address that is being read from,
             // because the superblock will not allow it to be overwritten before
-            // the end of the measure.
+            // the end of the bar.
 
             grid.cache.demote(address);
             grid.free_set.release(address);
@@ -720,7 +732,6 @@ pub fn GridType(comptime Storage: type) type {
             const write_header = schema.header_from_block(write.block.*);
             assert(write_header.size > @sizeOf(vsr.Header));
             assert(write_header.size <= constants.block_size);
-
             grid.superblock.storage.write_sectors(
                 write_block_callback,
                 &iop.completion,
