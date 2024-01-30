@@ -27,7 +27,7 @@ else
 fi
 
 # shellcheck disable=SC2086
-zig/zig build install -Drelease -Dconfig=production $ZIG_TARGET
+zig/zig build install -Dconfig=production $ZIG_TARGET
 
 function onerror {
     if [ "$?" == "0" ]; then
@@ -64,13 +64,13 @@ for I in $REPLICAS
 do
     echo "Starting replica $I..."
     FILE="./0_${I}.tigerbeetle.benchmark"
-    ./tigerbeetle start "--addresses=${PORT}" "$FILE" >> benchmark.log 2>&1 &
+    ./tigerbeetle start "--addresses=${PORT}" "$FILE"  &
 done
 
 echo ""
 echo "Benchmarking..."
 # shellcheck disable=SC2086
-zig/zig build benchmark -Drelease -Dconfig=production $ZIG_TARGET -- --addresses="${PORT}" "$@"
+zig/zig build benchmark -Dconfig=production $ZIG_TARGET -- --addresses="${PORT}" "$@"
 echo ""
 
 for I in $REPLICAS
