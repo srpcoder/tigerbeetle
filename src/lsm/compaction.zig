@@ -91,7 +91,8 @@ pub const CompactionBlocks = struct {
     target_value_blocks_max: [2]usize,
 };
 
-const BlipCallback = *const fn (*anyopaque, ?bool, ?bool) void;
+pub const Exhausted = struct { bar: bool, beat: bool };
+const BlipCallback = *const fn (*anyopaque, ?Exhausted) void;
 pub const BlipStage = enum { read, merge, write };
 
 pub fn CompactionInterfaceType(comptime Grid: type, comptime tree_infos: anytype) type {
@@ -568,7 +569,7 @@ pub fn CompactionType(
                 }
             }
 
-            fn deactivate_and_assert_and_callback(self: *Beat, stage: BlipStage, arg1: ?bool, arg2: ?bool) void {
+            fn deactivate_and_assert_and_callback(self: *Beat, stage: BlipStage, exhausted: ?Exhausted) void {
                 switch (stage) {
                     .read => {
                         assert(self.read != null);
@@ -581,7 +582,7 @@ pub fn CompactionType(
                         self.read_split = (self.read_split + 1) % 2;
                         self.read = null;
 
-                        callback(ptr, arg1, arg2);
+                        callback(ptr, exhausted);
                     },
                     .merge => {
                         assert(self.merge != null);
@@ -592,7 +593,7 @@ pub fn CompactionType(
                         self.merge_split = (self.merge_split + 1) % 2;
                         self.merge = null;
 
-                        callback(ptr, arg1, arg2);
+                        callback(ptr, exhausted);
                     },
                     .write => {
                         assert(self.write != null);
@@ -604,7 +605,7 @@ pub fn CompactionType(
                         self.write_split = (self.write_split + 1) % 2;
                         self.write = null;
 
-                        callback(ptr, arg1, arg2);
+                        callback(ptr, exhausted);
                     },
                 }
             }
@@ -956,6 +957,7 @@ pub fn CompactionType(
             var read_target: usize = 0;
             switch (bar.table_info_a) {
                 .disk => |table_ref| {
+                    assert(false);
                     beat.grid_reads[read_target].target = compaction;
                     beat.grid_reads[read_target].hack = read_target;
                     compaction.grid.read_block(
@@ -971,10 +973,10 @@ pub fn CompactionType(
                     // Immutable values come from the in memory immutable table - no need to do any reads.
                 },
             }
-            // ALWAYS increment read_target for now.
-            read_target += 1;
+            // ALWAYS increment read_target for now, so index for table_a is in [0].
+            if (read_target == 0) read_target += 1;
 
-            // FIXME: This of course assumes infinite buffer space :)
+            // FIXME: This assumes we have 1 + lsm_growth_factor blocks available.
             for (bar.range_b.tables.const_slice()) |table_ref| {
                 beat.grid_reads[read_target].target = compaction;
                 beat.grid_reads[read_target].hack = read_target;
@@ -1006,17 +1008,15 @@ pub fn CompactionType(
             assert(compaction.beat != null);
             assert(compaction.tree_config.id == schema.TableIndex.metadata(index_block).tree_id);
 
-            const bar = &compaction.bar.?;
-            _ = bar;
             const beat = &compaction.beat.?;
 
-            // FIXME: Figure out where our read target should go in a better way...
             assert(beat.read != null);
             const read = &beat.read.?;
 
             read.pending_reads_index -= 1;
             read.timer_read += 1;
 
+            // FIXME: Figure out where our read target should go in a better way...
             const read_index = parent.hack;
             stdx.copy_disjoint(.exact, u8, beat.blocks.source_index_blocks[read_index], index_block);
             log.info("blip_read({}): Copied index block to {}", .{ beat.read_split, read_index });
@@ -1040,15 +1040,15 @@ pub fn CompactionType(
             assert(beat.read != null);
             const read = &beat.read.?;
 
-            // Used to select the Grid.Read to use - so shared between table a and table b.
-            var read_target: usize = 0;
-            var value_blocks_read_a: usize = 0;
-            var value_blocks_read_b: usize = 0;
-
             // Save values before this read, in case we need to discard it.
             bar.previous_table_b_index_block_index = bar.current_table_b_index_block_index;
             bar.previous_table_a_value_block_index = bar.current_table_a_value_block_index;
             bar.previous_table_b_value_block_index = bar.current_table_b_value_block_index;
+
+            var value_blocks_read_a: usize = 0;
+            var value_blocks_read_b: usize = 0;
+
+            assert(read.pending_reads_data == 0);
 
             // Read data for table a - which we'll only have if we're coming from disk.
             if (bar.table_info_a == .disk) {
@@ -1063,23 +1063,22 @@ pub fn CompactionType(
                 const value_block_checksums = index_schema.data_checksums_used(index_block);
 
                 while (value_blocks_read_a < beat.blocks.source_value_blocks[beat.read_split][0].len and value_blocks_read_a < value_blocks_used) {
-                    beat.grid_reads[read_target].target = compaction;
-                    beat.grid_reads[read_target].hack = read_target;
+                    beat.grid_reads[read.pending_reads_data].target = compaction;
+                    beat.grid_reads[read.pending_reads_data].hack = read.pending_reads_data;
                     compaction.grid.read_block(
                         .{ .from_local_or_global_storage = blip_read_data_callback },
-                        &beat.grid_reads[read_target].read,
+                        &beat.grid_reads[read.pending_reads_data].read,
                         value_block_addresses[value_blocks_read_a],
                         value_block_checksums[value_blocks_read_a].value,
                         .{ .cache_read = true, .cache_write = true },
                     );
 
                     read.pending_reads_data += 1;
-                    read_target += 1;
                     value_blocks_read_a += 1;
                 }
             }
 
-            // Read data for our tables in range b.
+            // Read data for our tables in range b, which will always come from disk.
             const table_b_count = bar.range_b.tables.count();
 
             // FIXME: bar.current_table_b_index_block_index is incremented here, which means if we do a blip_read and then throw it away,
@@ -1101,19 +1100,18 @@ pub fn CompactionType(
                 assert(bar.current_table_b_value_block_index < value_blocks_used);
                 // Try read in as many value blocks as this index block has...
                 while (bar.current_table_b_value_block_index < value_blocks_used) {
-                    beat.grid_reads[read_target].target = compaction;
-                    beat.grid_reads[read_target].hack = read_target;
+                    beat.grid_reads[read.pending_reads_data].target = compaction;
+                    beat.grid_reads[read.pending_reads_data].hack = read.pending_reads_data;
                     std.log.info("Issuing read for index block {} value block {}", .{ bar.current_table_b_index_block_index, bar.current_table_b_value_block_index });
                     compaction.grid.read_block(
                         .{ .from_local_or_global_storage = blip_read_data_callback },
-                        &beat.grid_reads[read_target].read,
+                        &beat.grid_reads[read.pending_reads_data].read,
                         value_block_addresses[bar.current_table_b_value_block_index],
                         value_block_checksums[bar.current_table_b_value_block_index].value,
                         .{ .cache_read = true, .cache_write = true },
                     );
 
                     read.pending_reads_data += 1;
-                    read_target += 1;
                     value_blocks_read_b += 1;
                     bar.current_table_b_value_block_index += 1;
 
@@ -1147,8 +1145,6 @@ pub fn CompactionType(
             assert(compaction.bar != null);
             assert(compaction.beat != null);
 
-            const bar = &compaction.bar.?;
-            _ = bar;
             const beat = &compaction.beat.?;
 
             assert(beat.read != null);
@@ -1163,7 +1159,12 @@ pub fn CompactionType(
             const read_index = parent.hack;
 
             // log.info("blip_read({}): copying value block to [{}][{}][{}]", .{ beat.read_split, beat.read_split, table_a_or_b, read_index });
-            stdx.copy_disjoint(.exact, u8, beat.blocks.source_value_blocks[beat.read_split][table_a_or_b][read_index], value_block);
+            stdx.copy_disjoint(
+                .exact,
+                u8,
+                beat.blocks.source_value_blocks[beat.read_split][table_a_or_b][read_index],
+                value_block,
+            );
 
             // Join on all outstanding reads before continuing.
             if (read.pending_reads_data != 0) return;
@@ -1180,7 +1181,7 @@ pub fn CompactionType(
             const duration = read.*.?.timer.read();
             log.info("blip_read({}): Took {} to read all blocks - {}", .{ beat.read_split, std.fmt.fmtDuration(duration), read.*.?.timer_read });
 
-            beat.deactivate_and_assert_and_callback(.read, null, null);
+            beat.deactivate_and_assert_and_callback(.read, null);
         }
 
         pub fn undo_blip_read(compaction: *Compaction) void {
@@ -1310,8 +1311,8 @@ pub fn CompactionType(
             beat.activate_and_assert(.merge, callback, ptr);
             const merge = &beat.merge.?;
 
-            var input_exhausted_bar = false;
-            var input_exhausted_beat = false;
+            var source_exhausted_bar = false;
+            var source_exhausted_beat = false;
 
             assert(bar.table_builder.value_count < Table.layout.block_value_count_max);
 
@@ -1403,20 +1404,20 @@ pub fn CompactionType(
                 //
                 // This means that we'll potentially overrun our per_beat_input_goal by up to
                 // a full value block.
-                input_exhausted_bar = values_in_a_len + values_in_b_len == 0;
-                input_exhausted_beat = beat.input_values_processed >= bar.per_beat_input_goal;
+                source_exhausted_bar = values_in_a_len + values_in_b_len == 0;
+                source_exhausted_beat = beat.input_values_processed >= bar.per_beat_input_goal;
 
-                log.info("blip_merge({}): merged {} so far, goal {}. (input_exhausted_bar: {}, input_exhausted_beat: {})", .{
+                log.info("blip_merge({}): merged {} so far, goal {}. (source_exhausted_bar: {}, source_exhausted_beat: {})", .{
                     beat.merge_split,
                     beat.input_values_processed,
                     bar.per_beat_input_goal,
-                    input_exhausted_bar,
-                    input_exhausted_beat,
+                    source_exhausted_bar,
+                    source_exhausted_beat,
                 });
 
-                switch (compaction.check_and_finish_blocks(input_exhausted_bar)) {
+                switch (compaction.check_and_finish_blocks(source_exhausted_bar)) {
                     .unfinished_value_block => continue,
-                    .finished_value_block => if (input_exhausted_beat) break,
+                    .finished_value_block => if (source_exhausted_beat) break,
                     .need_write => break,
                 }
             }
@@ -1431,7 +1432,10 @@ pub fn CompactionType(
             const d = merge.timer.read();
             log.info("blip_merge({}): Took {} to CPU merge block", .{ beat.merge_split, std.fmt.fmtDuration(d) });
 
-            beat.deactivate_and_assert_and_callback(.merge, input_exhausted_bar or input_exhausted_beat, input_exhausted_bar);
+            beat.deactivate_and_assert_and_callback(.merge, .{
+                .bar = source_exhausted_bar,
+                .beat = source_exhausted_bar or source_exhausted_beat,
+            });
         }
 
         fn check_and_finish_blocks(compaction: *Compaction, force_flush: bool) enum {
@@ -1608,7 +1612,7 @@ pub fn CompactionType(
 
             const duration = write.*.?.timer.read();
             log.info("blip_write({}): all writes done - took {}.", .{ beat.write_split, std.fmt.fmtDuration(duration) });
-            beat.deactivate_and_assert_and_callback(.write, null, null);
+            beat.deactivate_and_assert_and_callback(.write, null);
         }
 
         pub fn beat_grid_forfeit(compaction: *Compaction) void {

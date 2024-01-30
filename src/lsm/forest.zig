@@ -19,6 +19,7 @@ const ScanBufferPool = @import("scan_buffer.zig").ScanBufferPool;
 const CompactionInterfaceType = @import("compaction.zig").CompactionInterfaceType;
 const CompactionBlocks = @import("compaction.zig").CompactionBlocks;
 const BlipStage = @import("compaction.zig").BlipStage;
+const Exhausted = @import("compaction.zig").Exhausted;
 
 const table_count_max = @import("tree.zig").table_count_max;
 
@@ -187,7 +188,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             beat_active_compactions: CompactionBitset = CompactionBitset.initEmpty(),
             beat_reserved_compactions: CompactionBitset = CompactionBitset.initEmpty(),
 
-            beat_exhausted: bool = false,
+            exhausted_beat: bool = false,
 
             slots: [3]?PipelineSlot = .{ null, null, null },
             slot_filled_count: usize = 0,
@@ -393,7 +394,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
             // FIXME: See comments in the interface.. But this sucks, can be messed up easily, and there must be a better way!
             // Maybe a context struct or something?
-            fn blip_callback(compaction_interface_opaque: *anyopaque, maybe_beat_exhausted: ?bool, maybe_bar_exhausted: ?bool) void {
+            fn blip_callback(compaction_interface_opaque: *anyopaque, maybe_exhausted: ?Exhausted) void {
                 const compaction_interface: *CompactionInterface = @ptrCast(@alignCast(compaction_interface_opaque));
                 const pipeline = @fieldParentPtr(PipelineSlot, "interface", compaction_interface).pipeline;
 
@@ -406,19 +407,16 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 } else @panic("no matching slot");
 
                 // Currently only CPU is allowed to tell us we're exhausted.
-                assert(maybe_beat_exhausted == null or slot.active_operation == .merge);
-                assert(maybe_bar_exhausted == null or slot.active_operation == .merge);
+                assert(maybe_exhausted == null or slot.active_operation == .merge);
 
-                if (maybe_beat_exhausted) |beat_exhausted| {
-                    log.info("blip_callback: marking beat_active_compactions({}) to be unset...", .{slot.compaction_index});
-                    pipeline.beat_exhausted = beat_exhausted;
-                }
+                if (maybe_exhausted) |exhausted| {
+                    if (exhausted.beat)
+                        log.info("blip_callback: marking beat_active_compactions({}) to be unset...", .{slot.compaction_index});
+                    pipeline.exhausted_beat = exhausted.beat;
 
-                // FIXME: Not great doing this here.
-                if (maybe_bar_exhausted) |bar_exhausted| {
-                    if (bar_exhausted) {
+                    if (exhausted.bar) {
                         // If the bar is exhausted the beat must be exhausted too.
-                        assert(maybe_beat_exhausted.?);
+                        assert(pipeline.exhausted_beat);
                         log.info("blip_callback: unsetting bar_active_compactions({})...", .{slot.compaction_index});
                         pipeline.bar_active_compactions.unset(slot.compaction_index);
                     }
@@ -459,8 +457,8 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                         .read => {
                             assert(cpu == null);
 
-                            if (self.beat_exhausted) {
-                                // If we hit beat_exhausted, it means that we need to discard the
+                            if (self.exhausted_beat) {
+                                // If we hit exhausted_beat, it means that we need to discard the
                                 // results of this read by rolling back the internal state.
                                 log.info("!!!!!!!!!! doing undo_blip_read()", .{});
                                 slot.interface.undo_blip_read();
@@ -476,7 +474,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                             slot.interface.blip_write(blip_callback);
                         },
                         .write => {
-                            if (self.beat_exhausted) {
+                            if (self.exhausted_beat) {
                                 if (self.slot_running_count > 0) {
                                     return;
                                 }
@@ -487,7 +485,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                                 // FIXME: Resetting these like this sucks.
                                 self.beat_active_compactions.unset(slot.compaction_index);
 
-                                self.beat_exhausted = false;
+                                self.exhausted_beat = false;
                                 self.slot_filled_count = 0;
                                 assert(self.slot_running_count == 0);
                                 self.state = .filling;
@@ -505,7 +503,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 }
 
                 // Fill any empty slots (slots always start in read).
-                if (self.state == .filling and !self.beat_exhausted) {
+                if (self.state == .filling and !self.exhausted_beat) {
                     const slot_idx = self.slot_filled_count;
 
                     log.info("Starting slot in: {}...", .{slot_idx});
@@ -537,7 +535,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                     if (self.slot_filled_count == 3) {
                         self.state = .full;
                     }
-                } else if (self.state == .filling and self.beat_exhausted) {
+                } else if (self.state == .filling and self.exhausted_beat) {
                     log.info("Pipeline has {} filled slots and is in .filling - but beat exhausted so not filling.", .{self.slot_filled_count});
                 }
 
