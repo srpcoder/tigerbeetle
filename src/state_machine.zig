@@ -75,35 +75,35 @@ pub fn StateMachineType(
             pub const tree_ids = struct {
                 pub const accounts = .{
                     .id = 1,
-                    .debits_pending = 2,
-                    .debits_posted = 3,
-                    .credits_pending = 4,
-                    .credits_posted = 5,
-                    .user_data_128 = 6,
-                    .user_data_64 = 7,
-                    .user_data_32 = 8,
-                    .ledger = 9,
-                    .code = 10,
-                    .timestamp = 11,
+                    // .debits_pending = 2,
+                    // .debits_posted = 3,
+                    // .credits_pending = 4,
+                    // .credits_posted = 5,
+                    // .user_data_128 = 6,
+                    // .user_data_64 = 7,
+                    // .user_data_32 = 8,
+                    // .ledger = 9,
+                    // .code = 10,
+                    .timestamp = 2,
                 };
 
                 pub const transfers = .{
-                    .id = 12,
-                    .debit_account_id = 13,
-                    .credit_account_id = 14,
-                    .amount = 15,
-                    .pending_id = 16,
-                    .user_data_128 = 17,
-                    .user_data_64 = 18,
-                    .user_data_32 = 19,
-                    .timeout = 20,
-                    .ledger = 21,
-                    .code = 22,
-                    .timestamp = 23,
+                    .id = 3,
+                    // .debit_account_id = 13,
+                    // .credit_account_id = 14,
+                    // .amount = 15,
+                    // .pending_id = 16,
+                    // .user_data_128 = 17,
+                    // .user_data_64 = 18,
+                    // .user_data_32 = 19,
+                    // .timeout = 20,
+                    // .ledger = 21,
+                    // .code = 22,
+                    .timestamp = 4,
                 };
 
                 pub const posted = .{
-                    .timestamp = 24,
+                    .timestamp = 5,
                 };
             };
         };
@@ -167,39 +167,12 @@ pub fn StateMachineType(
                 .ids = constants.tree_ids.accounts,
                 .value_count_max = .{
                     .id = config.lsm_batch_multiple * constants.batch_max.create_accounts,
-                    // Transfers mutate the secondary indices for debits/credits pending/posted.
-                    //
-                    // * Each mutation results in a remove and an insert: the ×2 multiplier.
-                    // * Each transfer modifies two accounts. However, this does not
-                    //   necessitate an additional ×2 multiplier — the credits of the debit
-                    //   account and the debits of the credit account are not modified.
-                    .debits_pending = config.lsm_batch_multiple * @as(usize, @max(
-                        constants.batch_max.create_accounts,
-                        2 * constants.batch_max.create_transfers,
-                    )),
-                    .debits_posted = config.lsm_batch_multiple * @as(usize, @max(
-                        constants.batch_max.create_accounts,
-                        2 * constants.batch_max.create_transfers,
-                    )),
-                    .credits_pending = config.lsm_batch_multiple * @as(usize, @max(
-                        constants.batch_max.create_accounts,
-                        2 * constants.batch_max.create_transfers,
-                    )),
-                    .credits_posted = config.lsm_batch_multiple * @as(usize, @max(
-                        constants.batch_max.create_accounts,
-                        2 * constants.batch_max.create_transfers,
-                    )),
-                    .user_data_128 = config.lsm_batch_multiple * constants.batch_max.create_accounts,
-                    .user_data_64 = config.lsm_batch_multiple * constants.batch_max.create_accounts,
-                    .user_data_32 = config.lsm_batch_multiple * constants.batch_max.create_accounts,
-                    .ledger = config.lsm_batch_multiple * constants.batch_max.create_accounts,
-                    .code = config.lsm_batch_multiple * constants.batch_max.create_accounts,
                     .timestamp = config.lsm_batch_multiple * @as(usize, @max(
                         constants.batch_max.create_accounts,
                         2 * constants.batch_max.create_transfers,
                     )),
                 },
-                .ignored = &[_][]const u8{ "flags", "reserved" },
+                .ignored = &[_][]const u8{ "flags", "reserved", "debits_pending", "debits_posted", "credits_pending", "credits_posted", "user_data_128", "user_data_64", "user_data_32", "ledger", "code" },
                 .derived = .{},
             },
         );
@@ -212,18 +185,8 @@ pub fn StateMachineType(
                 .value_count_max = .{
                     .timestamp = config.lsm_batch_multiple * constants.batch_max.create_transfers,
                     .id = config.lsm_batch_multiple * constants.batch_max.create_transfers,
-                    .debit_account_id = config.lsm_batch_multiple * constants.batch_max.create_transfers,
-                    .credit_account_id = config.lsm_batch_multiple * constants.batch_max.create_transfers,
-                    .amount = config.lsm_batch_multiple * constants.batch_max.create_transfers,
-                    .pending_id = config.lsm_batch_multiple * constants.batch_max.create_transfers,
-                    .user_data_128 = config.lsm_batch_multiple * constants.batch_max.create_transfers,
-                    .user_data_64 = config.lsm_batch_multiple * constants.batch_max.create_transfers,
-                    .user_data_32 = config.lsm_batch_multiple * constants.batch_max.create_transfers,
-                    .timeout = config.lsm_batch_multiple * constants.batch_max.create_transfers,
-                    .ledger = config.lsm_batch_multiple * constants.batch_max.create_transfers,
-                    .code = config.lsm_batch_multiple * constants.batch_max.create_transfers,
                 },
-                .ignored = &[_][]const u8{"flags"},
+                .ignored = &[_][]const u8{ "flags", "debit_account_id", "credit_account_id", "amount", "pending_id", "user_data_128", "user_data_64", "user_data_32", "timeout", "ledger", "code" },
                 .derived = .{},
             },
         );
@@ -264,7 +227,7 @@ pub fn StateMachineType(
             .posted = PostedGroove,
         });
 
-        const TransfersScanLookup = ScanLookupType(TransfersGroove, Storage);
+        const TransfersScanLookup = void; //ScanLookupType(TransfersGroove, Storage);
 
         pub const Operation = enum(u8) {
             /// Operations exported by TigerBeetle:
@@ -634,64 +597,65 @@ pub fn StateMachineType(
 
             const transfers_groove: *TransfersGroove = &self.forest.grooves.transfers;
             const scan_builder: *TransfersGroove.ScanBuilder = &transfers_groove.scan_builder;
+            _ = scan_builder;
 
-            const scan = scan: {
-                const timestamp_range: TimestampRange = .{
-                    .min = if (filter.timestamp_min == 0)
-                        TimestampRange.timestamp_min
-                    else
-                        filter.timestamp_min,
+            // const scan = scan: {
+            //     const timestamp_range: TimestampRange = .{
+            //         .min = if (filter.timestamp_min == 0)
+            //             TimestampRange.timestamp_min
+            //         else
+            //             filter.timestamp_min,
 
-                    .max = if (filter.timestamp_max == 0)
-                        TimestampRange.timestamp_max
-                    else
-                        filter.timestamp_max,
-                };
+            //         .max = if (filter.timestamp_max == 0)
+            //             TimestampRange.timestamp_max
+            //         else
+            //             filter.timestamp_max,
+            //     };
 
-                // This query may have 2 conditions:
-                // `WHERE debit_account_id = $account_id OR credit_account_id = $account_id`.
-                var scan_conditions: stdx.BoundedArray(*TransfersGroove.ScanBuilder.Scan, 2) = .{};
-                const direction: Direction = if (filter.flags.reversed) .descending else .ascending;
+            //     // This query may have 2 conditions:
+            //     // `WHERE debit_account_id = $account_id OR credit_account_id = $account_id`.
+            //     var scan_conditions: stdx.BoundedArray(*TransfersGroove.ScanBuilder.Scan, 2) = .{};
+            //     const direction: Direction = if (filter.flags.reversed) .descending else .ascending;
 
-                // Adding the condition for `debit_account_id = $account_id`.
-                if (filter.flags.debits) {
-                    scan_conditions.append_assume_capacity(scan_builder.scan_prefix(
-                        .debit_account_id,
-                        self.forest.scan_buffer_pool.acquire_assume_capacity(),
-                        snapshot_latest,
-                        filter.account_id,
-                        timestamp_range,
-                        direction,
-                    ));
-                }
+            //     // Adding the condition for `debit_account_id = $account_id`.
+            //     if (filter.flags.debits) {
+            //         scan_conditions.append_assume_capacity(scan_builder.scan_prefix(
+            //             .debit_account_id,
+            //             self.forest.scan_buffer_pool.acquire_assume_capacity(),
+            //             snapshot_latest,
+            //             filter.account_id,
+            //             timestamp_range,
+            //             direction,
+            //         ));
+            //     }
 
-                // Adding the condition for `credit_account_id = $account_id`.
-                if (filter.flags.credits) {
-                    scan_conditions.append_assume_capacity(scan_builder.scan_prefix(
-                        .credit_account_id,
-                        self.forest.scan_buffer_pool.acquire_assume_capacity(),
-                        snapshot_latest,
-                        filter.account_id,
-                        timestamp_range,
-                        direction,
-                    ));
-                }
+            //     // Adding the condition for `credit_account_id = $account_id`.
+            //     if (filter.flags.credits) {
+            //         scan_conditions.append_assume_capacity(scan_builder.scan_prefix(
+            //             .credit_account_id,
+            //             self.forest.scan_buffer_pool.acquire_assume_capacity(),
+            //             snapshot_latest,
+            //             filter.account_id,
+            //             timestamp_range,
+            //             direction,
+            //         ));
+            //     }
 
-                break :scan switch (scan_conditions.count()) {
-                    1 => scan_conditions.get(0),
-                    // Creating an union `OR` with the conditions.
-                    2 => scan_builder.merge_union(scan_conditions.const_slice()),
-                    else => unreachable,
-                };
-            };
+            //     break :scan switch (scan_conditions.count()) {
+            //         1 => scan_conditions.get(0),
+            //         // Creating an union `OR` with the conditions.
+            //         2 => scan_builder.merge_union(scan_conditions.const_slice()),
+            //         else => unreachable,
+            //     };
+            // };
 
-            // Initializing a lookup for the `Transfers` found by the scan:
-            self.scan_lookup = TransfersScanLookup.init(transfers_groove, scan);
-            self.scan_lookup.read(
-                // Limiting the buffer size according to the query limit.
-                self.scan_buffer[0..@min(filter.limit, self.scan_buffer.len)],
-                &scan_account_transfers_callback,
-            );
+            // // Initializing a lookup for the `Transfers` found by the scan:
+            // self.scan_lookup = TransfersScanLookup.init(transfers_groove, scan);
+            // self.scan_lookup.read(
+            //     // Limiting the buffer size according to the query limit.
+            //     self.scan_buffer[0..@min(filter.limit, self.scan_buffer.len)],
+            //     &scan_account_transfers_callback,
+            // );
         }
 
         fn scan_account_transfers_validation_callback(completion: *Grid.NextTick) void {
@@ -1330,17 +1294,7 @@ pub fn StateMachineType(
                     .cache_entries_max = options.cache_entries_accounts,
                     .tree_options_object = .{},
                     .tree_options_id = .{},
-                    .tree_options_index = .{
-                        .user_data_128 = .{},
-                        .user_data_64 = .{},
-                        .user_data_32 = .{},
-                        .ledger = .{},
-                        .code = .{},
-                        .debits_pending = .{},
-                        .debits_posted = .{},
-                        .credits_pending = .{},
-                        .credits_posted = .{},
-                    },
+                    .tree_options_index = .{},
                 },
                 .transfers = .{
                     // lookup_transfer() looks up 1 Transfer.
@@ -1351,18 +1305,7 @@ pub fn StateMachineType(
                     .cache_entries_max = options.cache_entries_transfers,
                     .tree_options_object = .{},
                     .tree_options_id = .{},
-                    .tree_options_index = .{
-                        .debit_account_id = .{},
-                        .credit_account_id = .{},
-                        .user_data_128 = .{},
-                        .user_data_64 = .{},
-                        .user_data_32 = .{},
-                        .pending_id = .{},
-                        .timeout = .{},
-                        .ledger = .{},
-                        .code = .{},
-                        .amount = .{},
-                    },
+                    .tree_options_index = .{},
                 },
                 .posted = .{
                     // Nothing lookups posted groove.
