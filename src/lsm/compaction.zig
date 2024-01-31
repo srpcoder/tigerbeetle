@@ -181,12 +181,6 @@ pub fn CompactionInterfaceType(comptime Grid: type, comptime tree_infos: anytype
             };
         }
 
-        pub fn fixup_buffers(self: *Self) void {
-            return switch (self.dispatcher) {
-                inline else => |compaction_impl| compaction_impl.fixup_buffers(),
-            };
-        }
-
         pub fn undo_blip_read(self: *Self) void {
             return switch (self.dispatcher) {
                 inline else => |compaction_impl| compaction_impl.undo_blip_read(),
@@ -328,58 +322,6 @@ pub fn CompactionType(
             }
         };
 
-        const UnifiedIterator = struct {
-            const Dispatcher = union(enum) {
-                value_block_iterator: ValueBlocksIterator,
-                table_memory_iterator: Tree.TableMemory.Iterator,
-            };
-
-            dispatcher: Dispatcher,
-
-            // FIXME: Do we want this iterator to return ptrs rather?
-            pub fn next(self: *UnifiedIterator) ?Table.Value {
-                return switch (self.dispatcher) {
-                    inline else => |*iterator_impl| iterator_impl.next(),
-                };
-            }
-
-            pub fn peek(self: *UnifiedIterator) ?Table.Value {
-                return switch (self.dispatcher) {
-                    inline else => |*iterator_impl| iterator_impl.peek(),
-                };
-            }
-
-            pub fn remaining(self: *const UnifiedIterator) usize {
-                return switch (self.dispatcher) {
-                    inline else => |iterator_impl| iterator_impl.remaining(),
-                };
-            }
-
-            pub fn get_source_index(self: *const UnifiedIterator) usize {
-                return switch (self.dispatcher) {
-                    inline else => |iterator_impl| iterator_impl.source_index,
-                };
-            }
-
-            pub fn get_block_index(self: *const UnifiedIterator) usize {
-                return switch (self.dispatcher) {
-                    inline else => |iterator_impl| iterator_impl.active_block_index,
-                };
-            }
-
-            /// We allow each underlying iterator type to implement its own optimized copy method.
-            pub fn copy(self: *UnifiedIterator, table_builder: *Table.Builder) void {
-                return switch (self.dispatcher) {
-                    inline else => |*iterator_impl| iterator_impl.copy(table_builder),
-                };
-            }
-        };
-
-        const ValuesIn = struct {
-            UnifiedIterator,
-            UnifiedIterator,
-        };
-
         const Bar = struct {
             tree: *Tree,
 
@@ -414,28 +356,11 @@ pub fn CompactionType(
             /// compaction_tables_value_count by the bar_finish.
             input_values_processed: u64 = 0,
 
-            // We have to track all of our input positions across bars. This breaks down to:
-            // * The current index block for table b (table a always has 1 at most).
-            // * The current value block position, _within_ that index block, for both tables.
-            // * The current value _within_ that value block, for both tables.
-            //
-            // This allows us to resume reads from the correct place across beats. There's an
-            // additional trick we do when we enter blip_merge():
-            // There's no guarantee that all values will be exhausted, so we move our blocks around
-            current_table_b_index_block_index: usize = 0,
+            /// When level_b == 0, it means level_a is the immutable table.
+            iterator_a: union(enum) { immutable: Tree.TableMemory.Iterator, disk: ValueBlocksIterator },
 
-            current_table_a_value_block_index: usize = 0,
-            current_table_b_value_block_index: usize = 0,
-
-            previous_table_b_index_block_index: usize = 0,
-
-            previous_table_a_value_block_index: usize = 0,
-            previous_table_b_value_block_index: usize = 0,
-
-            // These are only touched by blip_merge
-            current_block_a_index: usize = 0,
-            current_block_b_index: usize = 0,
-            iterator_block_b_position: usize = 0,
+            /// level_b always comes from disk.
+            iterator_b: ValueBlocksIterator,
 
             /// At least 2 output index blocks needs to span beat boundaries, otherwise it wouldn't be
             /// possible to pace at a more granular level than tables. We need 2 because of our pipeline
@@ -1040,10 +965,10 @@ pub fn CompactionType(
             assert(beat.read != null);
             const read = &beat.read.?;
 
-            // Save values before this read, in case we need to discard it.
-            bar.previous_table_b_index_block_index = bar.current_table_b_index_block_index;
-            bar.previous_table_a_value_block_index = bar.current_table_a_value_block_index;
-            bar.previous_table_b_value_block_index = bar.current_table_b_value_block_index;
+            // // Save values before this read, in case we need to discard it.
+            // bar.previous_table_b_index_block_index = bar.current_table_b_index_block_index;
+            // bar.previous_table_a_value_block_index = bar.current_table_a_value_block_index;
+            // bar.previous_table_b_value_block_index = bar.current_table_b_value_block_index;
 
             var value_blocks_read_a: usize = 0;
             var value_blocks_read_b: usize = 0;
@@ -1194,95 +1119,6 @@ pub fn CompactionType(
             bar.current_table_b_index_block_index = bar.previous_table_b_index_block_index;
             bar.current_table_a_value_block_index = bar.previous_table_a_value_block_index;
             bar.current_table_b_value_block_index = bar.previous_table_b_value_block_index;
-        }
-
-        /// When we do a blip_read, we assume that the position to start reading from is the end of
-        /// the previous read. For example, if blip_read(0) read blocks 0..10, blip_read(1) will
-        /// read blocks 10..20.
-        ///
-        /// However, there's no guarantee that our blip_merge(0) will actually consume all 10
-        /// blocks. In fact, it's likely not to, depending on buffer sizing. This presents a
-        /// problem for blip_merge(1) which needs to now operate on (nominally) 5..15.
-        ///
-        /// That's where this function comes in. We rearrange our blocks, so that the upcoming
-        /// merge split's input memory is continuous. This does result in reads being thrown
-        /// away.
-        /// TODO: Track those throw aways as a metric.
-        pub fn fixup_buffers(compaction: *Compaction) void {
-            const bar = &compaction.bar.?;
-            const beat = &compaction.beat.?;
-
-            // We get called between blips, on a pipeline boundary. Nothing should be active.
-            beat.assert_all_inactive();
-
-            // deactivate_and_assert_and_callback is responsible for incrementing the split, so
-            // beat.merge_split will be the next blip_merge that will run.
-            const current_split = beat.merge_split;
-            const previous_split = (beat.merge_split + 1) % 2;
-
-            std.log.info("Fixing buffers... Our last iterator got to {}", .{bar.iterator_block_b_position});
-            std.log.info(".... therefore, we need to make blocks.source_value_blocks[{}][1] start from blocks.source_value_blocks[{}][1][{}..]", .{ current_split, previous_split, bar.iterator_block_b_position });
-        }
-
-        fn calculate_values_in(compaction: *Compaction) ValuesIn {
-            assert(compaction.bar != null);
-            assert(compaction.beat != null);
-
-            const bar = &compaction.bar.?;
-            const beat = &compaction.beat.?;
-
-            assert(beat.merge != null);
-
-            const blocks_a = beat.blocks.source_value_blocks[beat.merge_split][0];
-            const blocks_b = beat.blocks.source_value_blocks[beat.merge_split][1];
-
-            std.log.info("blocks_a.len: {}, blocks_b.len: {}", .{ blocks_a.len, blocks_b.len });
-
-            // // Assert that we're reading value blocks in key order.
-            // const values_in = compaction.values_in[index];
-            // assert(values_in.len > 0);
-            // if (constants.verify) {
-            //     for (values_in[0 .. values_in.len - 1], values_in[1..]) |*value, *value_next| {
-            //         assert(key_from_value(value) < key_from_value(value_next));
-            //     }
-            // }
-            // const first_key = key_from_value(&values_in[0]);
-            // const last_key = key_from_value(&values_in[values_in.len - 1]);
-            // if (compaction.last_keys_in[index]) |last_key_prev| {
-            //     assert(last_key_prev < first_key);
-            // }
-            // if (values_in.len > 1) {
-            //     assert(first_key < last_key);
-            // }
-            // compaction.last_keys_in[index] = last_key;
-
-            // FIXME: Assert we're not exhausted.
-            switch (bar.table_info_a) {
-                .immutable => {
-                    log.info("blip_merge({}): values_a from immutable and blocks_b from source_value_blocks[{}][{}]", .{ beat.merge_split, beat.merge_split, 1 });
-                    return .{
-                        UnifiedIterator{ .dispatcher = .{
-                            .table_memory_iterator = Tree.TableMemory.Iterator.init(bar.table_info_a.immutable, bar.current_block_a_index),
-                        } },
-                        UnifiedIterator{ .dispatcher = .{
-                            .value_block_iterator = ValueBlocksIterator.init(blocks_b, bar.current_block_b_index),
-                        } },
-                    };
-                },
-                .disk => {
-                    assert(false); // FIXME: Unimplemented for now.
-                    @panic("foo");
-                    // const values_a = Table.data_block_values_used(blocks_a[merge.current_block_a]);
-                    // return .{
-                    //     UnifiedIterator{ .dispatcher = .{
-                    //         .value_block_iterator = ValueBlocksIterator.init(values_a, bar.current_block_a_index),
-                    //     } },
-                    //     UnifiedIterator{ .dispatcher = .{
-                    //         .value_block_iterator = ValueBlocksIterator.init(values_b, bar.current_block_b_index),
-                    //     } },
-                    // };
-                },
-            }
         }
 
         /// Perform CPU merge work, to transform our source tables to our target tables.

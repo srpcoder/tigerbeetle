@@ -151,7 +151,8 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
     const Grid = GridType(_Storage);
 
-    // TODO: With all this trouble, why not just store the compaction memory here and move it out of Tree entirely...
+    // TODO: With all this trouble, why not just store the compaction memory here and move it out
+    // of Tree entirely...
     const CompactionInterface = CompactionInterfaceType(Grid, _tree_infos);
 
     return struct {
@@ -173,6 +174,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
         };
 
         const CompactionPipeline = struct {
+            /// If you think of a pipeline diagram, a pipeline slot is a single instruction.
             const PipelineSlot = struct {
                 interface: CompactionInterface,
                 pipeline: *CompactionPipeline,
@@ -180,13 +182,26 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 compaction_index: usize,
             };
 
-            const compaction_count = (_tree_infos[_tree_infos.len - 1].tree_id - _tree_infos[0].tree_id) * constants.lsm_levels;
+            const compaction_count = (_tree_infos[_tree_infos.len - 1].tree_id -
+                _tree_infos[0].tree_id) * constants.lsm_levels;
             const CompactionBitset = std.StaticBitSet(compaction_count);
 
+            grid: *Grid,
+
+            /// Raw, linear buffer of blocks that will be split up.
+            compaction_blocks: []BlockPtr,
+            compaction_blocks_split: CompactionBlocks = undefined,
+
+            // TODO: If we want to be able to use our blocks freely, we need just as many reads as
+            // writes. We could do a union, just not sure if it's worth it yet.
+            compaction_reads: []Grid.FatRead,
+            compaction_writes: []Grid.FatWrite,
+
             compactions: stdx.BoundedArray(CompactionInterface, compaction_count) = .{},
-            bar_active_compactions: CompactionBitset = CompactionBitset.initEmpty(),
-            beat_active_compactions: CompactionBitset = CompactionBitset.initEmpty(),
-            beat_reserved_compactions: CompactionBitset = CompactionBitset.initEmpty(),
+
+            active_bar: CompactionBitset = CompactionBitset.initEmpty(),
+            active_beat: CompactionBitset = CompactionBitset.initEmpty(),
+            reserved_beat: CompactionBitset = CompactionBitset.initEmpty(),
 
             exhausted_beat: bool = false,
 
@@ -194,18 +209,9 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             slot_filled_count: usize = 0,
             slot_running_count: usize = 0,
 
-            // FIXME: So technically if we want to be able to use our blocks freely, we need as many reads and writes :/
-            // We could do a union, just not sure if it's worth it yet.
-            compaction_blocks: []BlockPtr,
-            compaction_reads: []Grid.FatRead,
-            compaction_writes: []Grid.FatWrite,
-
-            compaction_blocks_split: CompactionBlocks = undefined,
-
             state: enum { filling, full } = .filling,
 
             next_tick: Grid.NextTick = undefined,
-            grid: *Grid,
 
             forest: ?*Forest = null,
             callback: ?Callback = null,
@@ -241,63 +247,67 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 allocator.free(self.compaction_blocks);
             }
 
-            // FIXME: Currently the split by a / b is equal, but it shouldn't be for max performance.
-            /// Our input and output blocks (excluding index blocks for now) are split two ways. First, equally by pipeline stage
-            /// then by table a / table b:
+            // FIXME: This statically allocates blocks for the time being. It should be dynamic.
+            // FIXME: Currently the split by a / b is equal, but it shouldn't be for max
+            // performance.
+            /// Our source and output blocks (excluding index blocks for now) are split two ways.
+            /// First, equally by pipeline stage, then by table a / table b:
             /// -------------------------------------------------------------
             /// | Pipeline 0                  | Pipeline 1                  |
             /// |-----------------------------|-----------------------------|
             /// | Table A     | Table B       | Table A     | Table B       |
             /// -------------------------------------------------------------
             fn divide_blocks(self: *CompactionPipeline) CompactionBlocks {
-                var minimum_block_count: u64 = 0;
-                // We need a minimum of 2 input data blocks; one from each table.
-                minimum_block_count += 2;
+                const minimum_block_count: u64 = blk: {
+                    var minimum_block_count = 0;
 
-                // We need a minimum of 1 output data block.
-                minimum_block_count += 1;
+                    // We need a minimum of 2 source value blocks; one from each table.
+                    minimum_block_count += 2;
 
-                // Because we're a 3 stage pipeline, with the middle stage (cpu) having a data dependency on both
-                // read and write data blocks, we need to split our memory in the middle. This results in a doubling of
-                // what we have so far.
-                // FIXME: perhaps read_data_block?? Hmmm input is clearer I think.
-                minimum_block_count *= 2;
+                    // We need a minimum of 1 output value block.
+                    minimum_block_count += 1;
 
-                // Lastly, reserve our input index blocks. For now, just require we have enough for all tables and pretend like
-                // pipelining this isn't a thing.
-                // FIXME: This shouldn't do that. The minimum is 2; but we don't really need to hold on to index blocks
-                // if we read the data blocks directly. TBC.
-                minimum_block_count += 9;
+                    // Because we're a 3 stage pipeline, with the middle stage (merge) having a
+                    // data dependency on both read and write value blocks, we need to split our
+                    // memory in the middle. This results in a doubling of what we have so far.
+                    minimum_block_count *= 2;
 
-                // FIXME: We can also calculate the optimum number of blocks. Old comment below:
-                // // Actually... All the comments below would be to do _all_ the work required. The max amount to do the work required
-                // // per beat would then be divided by beat. _however_ the minimums won't change!
-                // // Minimum of 2, max lsm_growth_factor+1. Replaces index_block_a and index_block_b too.
-                // // Output index blocks are explicitly handled in bar_setup_budget.
-                // source_index_blocks: []BlockPtr,
-                // // Minimum of 2, one from each table. Max would be max possible data blocks in lsm_growth_factor+1 tables.
-                // source_value_blocks: []BlockPtr,
-                // // Minimum of 1, max would be max possible data blocks in lsm_growth_factor+1 tables.
-                // target_value_blocks: []BlockPtr,
+                    // Lastly, reserve our source index blocks. For now, just require we have
+                    // enough for all tables and pretend like pipelining this isn't a thing.
+                    // FIXME: This shouldn't do that. The minimum is 2; but we don't really need
+                    // to hold on to index blocks if we read the value blocks directly. TBC.
+                    minimum_block_count += 9;
+
+                    break :blk minimum_block_count;
+                };
 
                 const blocks = self.compaction_blocks;
 
                 assert(blocks.len >= minimum_block_count);
 
-                const source_index_blocks = blocks[0..9];
+                const source_index_blocks = blocks[0..10];
 
                 const source_value_pipeline_0_level_a = blocks[10..][0..10];
                 const source_value_pipeline_0_level_b = blocks[20..][0..10];
                 const source_value_pipeline_1_level_a = blocks[30..][0..10];
                 const source_value_pipeline_1_level_b = blocks[40..][0..10];
 
-                const output_value_pipeline_0 = blocks[100..][0..300];
-                const output_value_pipeline_1 = blocks[500..][0..300];
+                const output_value_pipeline_0 = blocks[50..][0..10];
+                const output_value_pipeline_1 = blocks[60..][0..10];
 
-                const source_value_blocks = .{ .{ source_value_pipeline_0_level_a, source_value_pipeline_0_level_b }, .{ source_value_pipeline_1_level_a, source_value_pipeline_1_level_b } };
+                const source_value_blocks = .{
+                    .{ source_value_pipeline_0_level_a, source_value_pipeline_0_level_b },
+                    .{ source_value_pipeline_1_level_a, source_value_pipeline_1_level_b },
+                };
                 const target_value_blocks = .{ output_value_pipeline_0, output_value_pipeline_1 };
-                const source_value_blocks_max = .{ .{ source_value_pipeline_0_level_a.len, source_value_pipeline_0_level_b.len }, .{ source_value_pipeline_1_level_a.len, source_value_pipeline_1_level_b.len } };
-                const target_value_blocks_max = .{ output_value_pipeline_0.len, output_value_pipeline_1.len };
+                const source_value_blocks_max = .{
+                    .{ source_value_pipeline_0_level_a.len, source_value_pipeline_0_level_b.len },
+                    .{ source_value_pipeline_1_level_a.len, source_value_pipeline_1_level_b.len },
+                };
+                const target_value_blocks_max = .{
+                    output_value_pipeline_0.len,
+                    output_value_pipeline_1.len,
+                };
 
                 return .{
                     .source_index_blocks = source_index_blocks,
@@ -309,20 +319,24 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 };
             }
 
-            pub fn beat(self: *CompactionPipeline, forest: *Forest, op: u64, callback: Callback) void {
+            pub fn beat(
+                self: *CompactionPipeline,
+                forest: *Forest,
+                op: u64,
+                callback: Callback,
+            ) void {
                 const compaction_beat = op % constants.lsm_batch_multiple;
-
                 const first_beat = compaction_beat == 0;
 
                 self.slot_filled_count = 0;
                 self.slot_running_count = 0;
 
                 if (first_beat) {
-                    self.bar_active_compactions = CompactionBitset.initEmpty();
+                    self.active_bar = CompactionBitset.initEmpty();
 
                     for (self.compactions.slice(), 0..) |*compaction, i| {
                         // A compaction is marked as live at the start of a bar.
-                        self.bar_active_compactions.set(i);
+                        self.active_bar.set(i);
 
                         // FIXME: These blocks need to be disjoint. Any way we can assert that?
                         const blocks = .{ self.compaction_blocks[900 + i .. 900 + i + 1], self.compaction_blocks[1000 + i .. 1000 + i + 1] };
@@ -333,20 +347,21 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                     self.compaction_blocks_split = self.divide_blocks();
                 }
 
-                // At the start of a beat, the active compactions are those that are still active in the bar.
-                self.beat_active_compactions = self.bar_active_compactions;
+                // At the start of a beat, the active compactions are those that are still active
+                // in the bar.
+                self.active_beat = self.active_bar;
 
-                // FIXME: Assert no compactions are running, and the pipeline is empty in a better way
-                // MAybe move to a union enum for state.
+                // FIXME: Assert no compactions are running, and the pipeline is empty in a better
+                // way. Maybe move to a union enum for state.
                 for (self.slots) |slot| assert(slot == null);
                 assert(self.callback == null);
                 assert(self.forest == null);
 
                 for (self.compactions.slice(), 0..) |*compaction, i| {
-                    if (!self.bar_active_compactions.isSet(i)) continue;
+                    if (!self.active_bar.isSet(i)) continue;
 
                     // Set up the beat depending on what buffers we have available.
-                    self.beat_reserved_compactions.set(i);
+                    self.reserved_beat.set(i);
                     compaction.beat_grid_reserve();
                 }
 
@@ -354,7 +369,6 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 self.forest = forest;
 
                 if (forest.compaction_pipeline.compactions.count() == 0) {
-                    // FIXME: Do we want to handle the case where we have 0 remaining compactions here too, or in advance_pipeline?
                     // No compactions - we're done! Likely we're < lsm_batch_multiple but it could
                     // be that empty ops were pulsed through.
                     maybe(op < constants.lsm_batch_multiple);
@@ -364,9 +378,8 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 }
 
                 // Everything up to this point has been sync and deterministic. We now enter
-                // async-land!
-                // Kick off the pipeline by starting a read. The blip_callback will do the rest,
-                // including filling and draining.
+                // async-land by starting a read. The blip_callback will do the rest, including
+                // filling and draining.
                 log.info("Firing up pipeline.", .{});
                 log.info("============================================================", .{});
                 self.state = .filling;
@@ -376,7 +389,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             fn beat_finished_next_tick(next_tick: *Grid.NextTick) void {
                 const self = @fieldParentPtr(CompactionPipeline, "next_tick", next_tick);
 
-                assert(self.beat_active_compactions.count() == 0);
+                assert(self.active_beat.count() == 0);
                 assert(self.slot_filled_count == 0);
                 assert(self.slot_running_count == 0);
                 for (self.slots) |slot| assert(slot == null);
@@ -392,12 +405,19 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 callback(forest);
             }
 
-            // FIXME: See comments in the interface.. But this sucks, can be messed up easily, and there must be a better way!
-            // Maybe a context struct or something?
+            // FIXME: It would be nice to get rid of *anyopaque here. I tried batiati's Scan
+            // approach but couldn't get it to compile.
             fn blip_callback(compaction_interface_opaque: *anyopaque, maybe_exhausted: ?Exhausted) void {
-                const compaction_interface: *CompactionInterface = @ptrCast(@alignCast(compaction_interface_opaque));
-                const pipeline = @fieldParentPtr(PipelineSlot, "interface", compaction_interface).pipeline;
+                const compaction_interface: *CompactionInterface = @ptrCast(
+                    @alignCast(compaction_interface_opaque),
+                );
+                const pipeline = @fieldParentPtr(
+                    PipelineSlot,
+                    "interface",
+                    compaction_interface,
+                ).pipeline;
 
+                // FIXME: Better way of getting the slot.
                 const slot = blk: for (0..3) |i| {
                     if (pipeline.slots[i]) |*slot| {
                         if (&slot.interface == compaction_interface) {
@@ -406,27 +426,33 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                     }
                 } else @panic("no matching slot");
 
-                // Currently only CPU is allowed to tell us we're exhausted.
+                // Currently only Merge is allowed to tell us we're exhausted.
+                // TODO: In future, this will be extended to read, which might be able to, based
+                // on key ranges.
                 assert(maybe_exhausted == null or slot.active_operation == .merge);
 
                 if (maybe_exhausted) |exhausted| {
                     if (exhausted.beat)
-                        log.info("blip_callback: marking beat_active_compactions({}) to be unset...", .{slot.compaction_index});
+                        log.info(
+                            "blip_callback: marking active_beat({}) to be unset...",
+                            .{slot.compaction_index},
+                        );
                     pipeline.exhausted_beat = exhausted.beat;
 
                     if (exhausted.bar) {
                         // If the bar is exhausted the beat must be exhausted too.
                         assert(pipeline.exhausted_beat);
-                        log.info("blip_callback: unsetting bar_active_compactions({})...", .{slot.compaction_index});
-                        pipeline.bar_active_compactions.unset(slot.compaction_index);
+                        log.info(
+                            "blip_callback: unsetting active_bar({})...",
+                            .{slot.compaction_index},
+                        );
+                        pipeline.active_bar.unset(slot.compaction_index);
                     }
                 }
 
                 // TODO: For now, we have a barrier on all stages... We might want to drop this, or
                 // have a more advanced barrier based on memory only.
                 pipeline.slot_running_count -= 1;
-
-                // We wait for all slots to be finished to keep our alignment.
                 if (pipeline.slot_running_count > 0) {
                     return;
                 }
@@ -437,18 +463,14 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             }
 
             fn advance_pipeline(self: *CompactionPipeline) void {
-                const active_compaction_index = self.beat_active_compactions.findFirstSet() orelse {
-                    log.info("advance_pipeline: All compactions finished! next_tick'ing handler.", .{});
+                const active_compaction_index = self.active_beat.findFirstSet() orelse {
+                    log.info("advance_pipeline: All compactions finished! Calling handler.", .{});
                     self.grid.on_next_tick(beat_finished_next_tick, &self.next_tick);
                     return;
                 };
                 log.info("advance_pipeline: Active compaction is: {}", .{active_compaction_index});
 
-                if (self.slots[0]) |*first_slot| {
-                    first_slot.interface.fixup_buffers();
-                }
-
-                // Advanced the current stages, making sure to start our reads and writes before CPU
+                // Advanced the current stages, making sure to start our IO before CPU.
                 var cpu: ?usize = null;
                 for (self.slots[0..self.slot_filled_count], 0..) |*slot_wrapped, i| {
                     const slot: *PipelineSlot = &slot_wrapped.*.?;
@@ -460,8 +482,10 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                             if (self.exhausted_beat) {
                                 // If we hit exhausted_beat, it means that we need to discard the
                                 // results of this read by rolling back the internal state.
-                                log.info("!!!!!!!!!! doing undo_blip_read()", .{});
-                                slot.interface.undo_blip_read();
+                                // FIXME: This is subject to the new streaming / iterator blip
+                                // read style.
+                                // log.info("!!!!!!!!!! doing undo_blip_read()", .{});
+                                // slot.interface.undo_blip_read();
                             } else {
                                 // Only start CPU work after read if we're not exhausted.
                                 cpu = i;
@@ -479,11 +503,12 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                                     return;
                                 }
 
-                                // If we're in the input exhausted state, we have no more reads that can be done, so don't schedule any more
+                                // If we're in the input exhausted state, we have no more reads
+                                // that can be done, so don't schedule any more.
                                 log.info("... ... blip_callback: write done on exhausted beat. Moving to next compaction in sequence.", .{});
 
-                                // FIXME: Resetting these like this sucks.
-                                self.beat_active_compactions.unset(slot.compaction_index);
+                                // FIXME: Resetting these below variables like this sucks.
+                                self.active_beat.unset(slot.compaction_index);
 
                                 self.exhausted_beat = false;
                                 self.slot_filled_count = 0;
@@ -493,7 +518,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
                                 return self.advance_pipeline();
                             }
-                            log.info("... ... blip_callback: write done, starting read on {}.", .{i});
+                            log.info("... blip_callback: write done, starting read on {}.", .{i});
                             slot.active_operation = .read;
                             self.slot_running_count += 1;
                             log.info("Slot {}, Compaction {}: Calling blip_read", .{ i, active_compaction_index });
@@ -526,11 +551,14 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                     }
 
                     // We always start with a read.
-                    log.info("Slot {}, Compaction {}: Calling blip_read", .{ slot_idx, self.slots[slot_idx].?.compaction_index });
+                    log.info("Slot {}, Compaction {}: Calling blip_read", .{
+                        slot_idx,
+                        self.slots[slot_idx].?.compaction_index,
+                    });
                     self.slot_running_count += 1;
-                    self.slots[slot_idx].?.interface.blip_read(blip_callback);
-
                     self.slot_filled_count += 1;
+
+                    self.slots[slot_idx].?.interface.blip_read(blip_callback);
 
                     if (self.slot_filled_count == 3) {
                         self.state = .full;
@@ -539,13 +567,13 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                     log.info("Pipeline has {} filled slots and is in .filling - but beat exhausted so not filling.", .{self.slot_filled_count});
                 }
 
-                // Only then start CPU work.
-                if (cpu) |c| {
-                    const slot = &self.slots[c].?;
+                // Now that IO is done, start CPU work if there was any.
+                if (cpu) |cpu_slot| {
+                    const slot = &self.slots[cpu_slot].?;
 
                     slot.active_operation = .merge;
                     self.slot_running_count += 1;
-                    log.info("Slot: {} Calling blip_merge", .{c});
+                    log.info("Slot: {} Calling blip_merge", .{cpu_slot});
                     slot.interface.blip_merge(blip_callback);
                 }
             }
@@ -555,17 +583,17 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 while (i > 0) {
                     i -= 1;
 
-                    // We need to run this for all compactions that ran acquire - even if they transitioned to being finished,
-                    // so we can't just use bar_active_compactions.
-                    if (!self.beat_reserved_compactions.isSet(i)) continue;
+                    // We need to run this for all compactions that ran acquire - even if they
+                    // transitioned to being finished, so we can't just use active_bar.
+                    if (!self.reserved_beat.isSet(i)) continue;
 
-                    // CompactionInterface internally stores a pointer to the real Compaction
-                    // interface, so by-value should be OK, but we're a bit all over the place.
+                    // FIXME: CompactionInterface internally stores a pointer to the real
+                    // Compaction interface, so by-value is OK, but we're a bit all over the place.
                     self.compactions.slice()[i].beat_grid_forfeit();
-                    self.beat_reserved_compactions.unset(i);
+                    self.reserved_beat.unset(i);
                 }
 
-                assert(self.beat_reserved_compactions.count() == 0);
+                assert(self.reserved_beat.count() == 0);
             }
         };
 
@@ -751,11 +779,14 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 log.info("===============================================================", .{});
                 assert(forest.compaction_pipeline.compactions.count() == 0);
 
+                // Iterate by levels first, then trees, as we expect similar levels to have similar
+                // time-of-death for writes. This helps internal SSD GC.
                 inline for (0..constants.lsm_levels) |level_b| {
                     inline for (tree_id_range.min..tree_id_range.max) |tree_id| {
                         var tree = tree_for_id(forest, tree_id);
 
-                        // FIXME: Big hack to limit to a single tree for debugging!
+                        // FIXME: Big hack to limit to a single tree for debugging! This only
+                        // compacts the Account object tree and discards the rest.
                         if (tree_id != 2) {
                             tree.table_immutable.mutability.immutable.flushed = true;
                         } else {
@@ -839,7 +870,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                     }
                 }
 
-                assert(forest.compaction_pipeline.bar_active_compactions.count() == 0);
+                assert(forest.compaction_pipeline.active_bar.count() == 0);
                 forest.compaction_pipeline.compactions.clear();
             }
 
