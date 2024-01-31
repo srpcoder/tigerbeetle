@@ -182,8 +182,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 compaction_index: usize,
             };
 
-            const compaction_count = (_tree_infos[_tree_infos.len - 1].tree_id -
-                _tree_infos[0].tree_id) * constants.lsm_levels;
+            const compaction_count = tree_infos.len * constants.lsm_levels;
             const CompactionBitset = std.StaticBitSet(compaction_count);
 
             grid: *Grid,
