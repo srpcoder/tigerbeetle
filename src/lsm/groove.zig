@@ -1044,7 +1044,6 @@ pub fn GrooveType(
             }
         }
 
-        // TODO: BIG NB! Need to compact the groove cache still!!!!
         pub fn compact(groove: *Groove, op: u64) void {
             // Compact the objects_cache on the last beat of the bar, just like the trees do to
             // their mutable tables.
@@ -1055,9 +1054,6 @@ pub fn GrooveType(
         }
 
         pub fn open_commence(groove: *Groove, manifest_log: *ManifestLog) void {
-            // TODO: Hoist out
-            // assert(groove.compacting == null);
-
             if (has_id) groove.ids.open_commence(manifest_log);
             groove.objects.open_commence(manifest_log);
 
@@ -1067,9 +1063,6 @@ pub fn GrooveType(
         }
 
         pub fn open_complete(groove: *Groove) void {
-            // TODO: Hoist out
-            // assert(groove.compacting == null);
-
             if (has_id) groove.ids.open_complete();
             groove.objects.open_complete();
 
@@ -1108,16 +1101,12 @@ pub fn GrooveType(
         }
 
         pub fn assert_between_bars(groove: *const Groove) void {
-            _ = groove;
-            // TODO!!
-            // assert(groove.compacting == null);
+            if (has_id) groove.ids.assert_between_bars();
+            groove.objects.assert_between_bars();
 
-            // if (has_id) groove.ids.assert_between_bars();
-            // groove.objects.assert_between_bars();
-
-            // inline for (std.meta.fields(IndexTrees)) |field| {
-            //     @field(groove.indexes, field.name).assert_between_bars();
-            // }
+            inline for (std.meta.fields(IndexTrees)) |field| {
+                @field(groove.indexes, field.name).assert_between_bars();
+            }
         }
     };
 }

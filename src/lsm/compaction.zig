@@ -582,6 +582,11 @@ pub fn CompactionType(
             };
         }
 
+        pub fn assert_between_bars(compaction: *Compaction) void {
+            assert(compaction.bar == null);
+            assert(compaction.beat == null);
+        }
+
         /// Perform the bar-wise setup, and returns the compaction work that needs to be done for
         /// scheduling decisions. Returns null if there's no compaction work, or if move_table
         /// is happening (since it only touches the manifest).

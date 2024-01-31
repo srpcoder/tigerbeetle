@@ -17,10 +17,9 @@ pub fn TableMemoryType(comptime Table: type) type {
 
         pub const Iterator = struct {
             table_memory: *TableMemory,
-            source_index: usize,
-            active_block_index: usize = 0,
+            source_index: usize = 0,
 
-            pub fn init(table_memory: *TableMemory, source_index: usize) Iterator {
+            pub fn init(table_memory: *TableMemory) Iterator {
                 const source = table_memory.values_used();
                 assert(source.len > 0);
 
@@ -34,7 +33,7 @@ pub fn TableMemoryType(comptime Table: type) type {
 
                     // Our output must be strictly increasing.
                     // An output length of 1 is always strictly increasing.
-                    var verify_iterator = Iterator{ .table_memory = table_memory, .source_index = source_index };
+                    var verify_iterator = Iterator{ .table_memory = table_memory };
                     var value = verify_iterator.next().?;
                     while (verify_iterator.next()) |value_next| {
                         assert(key_from_value(&value_next) > key_from_value(&value));
@@ -44,7 +43,6 @@ pub fn TableMemoryType(comptime Table: type) type {
 
                 return .{
                     .table_memory = table_memory,
-                    .source_index = source_index,
                 };
             }
 

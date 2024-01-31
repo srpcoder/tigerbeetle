@@ -539,6 +539,25 @@ pub fn TreeType(comptime TreeTable: type, comptime Storage: type) type {
             assert(tree.table_mutable.mutability == .mutable);
             assert(tree.table_immutable.mutability == .immutable);
         }
+
+        pub fn assert_between_bars(tree: *const Tree) void {
+            // Assert that this is the last beat in the compaction bar.
+            const compaction_beat = tree.compaction_op.? % constants.lsm_batch_multiple;
+            const last_beat_in_bar = constants.lsm_batch_multiple - 1;
+            assert(last_beat_in_bar == compaction_beat);
+
+            // Assert no outstanding compactions.
+            for (&tree.compactions) |*compaction| {
+                compaction.assert_between_bars();
+            }
+
+            // Assert all manifest levels haven't overflowed their table counts.
+            tree.manifest.assert_level_table_counts();
+
+            if (constants.verify) {
+                tree.manifest.assert_no_invisible_tables(&.{});
+            }
+        }
     };
 }
 
