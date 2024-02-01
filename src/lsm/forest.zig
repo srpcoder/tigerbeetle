@@ -258,7 +258,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             /// -------------------------------------------------------------
             fn divide_blocks(self: *CompactionPipeline) CompactionBlocks {
                 const minimum_block_count: u64 = blk: {
-                    var minimum_block_count = 0;
+                    var minimum_block_count: u64 = 0;
 
                     // We need a minimum of 2 source value blocks; one from each table.
                     minimum_block_count += 2;
