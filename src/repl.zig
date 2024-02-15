@@ -412,7 +412,7 @@ pub fn ReplType(comptime MessageBus: type) type {
     return struct {
         event_loop_done: bool,
         request_done: bool,
-        request: Client.Request,
+        request: Client.Request = undefined,
         request_data: stdx.BoundedArray(u8, constants.message_body_size_max) = .{},
 
         interactive: bool,
@@ -686,11 +686,11 @@ pub fn ReplType(comptime MessageBus: type) type {
                 return;
             }
 
-            repl.request_data = @TypeOf(repl.request_data).from_slice(arguments);
+            repl.request_data = @TypeOf(repl.request_data).from_slice(arguments) catch unreachable;
             repl.request_done = false;
             try repl.debug("Sending command: {}.\n", .{operation});
             repl.client.submit(
-                client_request_callback
+                client_request_callback,
                 &repl.request,
                 operation,
                 repl.request_data.const_slice(),
@@ -742,10 +742,10 @@ pub fn ReplType(comptime MessageBus: type) type {
 
         fn client_request_callback_error(
             request: *Client.Request,
-            operation: StateMachine.Operation,
             result: []const u8,
         ) !void {
             const repl = @fieldParentPtr(Repl, "request", request);
+            const operation = request.operation.cast(Client.StateMachine);
             assert(repl.request_done == false);
             try repl.debug("Operation completed: {}.\n", .{operation});
 
@@ -828,16 +828,11 @@ pub fn ReplType(comptime MessageBus: type) type {
         }
 
         fn client_request_callback(
-            user_data: u128,
-            operation: StateMachine.Operation,
+            request: *Client.Request,
             result: []const u8,
         ) void {
-            client_request_callback_error(
-                user_data,
-                operation,
-                result,
-            ) catch |err| {
-                const repl: *Repl = @ptrFromInt(@as(usize, @intCast(user_data)));
+            client_request_callback_error(request, result) catch |err| {
+                const repl = @fieldParentPtr(Repl, "request", request);
                 repl.fail("Error in callback: {any}", .{err}) catch return;
             };
         }

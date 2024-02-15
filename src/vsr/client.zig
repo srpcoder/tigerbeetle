@@ -14,7 +14,6 @@ const MessagePool = @import("../message_pool.zig").MessagePool;
 const Message = @import("../message_pool.zig").MessagePool.Message;
 const IOPS = @import("../iops.zig").IOPS;
 const FIFO = @import("../fifo.zig").FIFO;
-
 const log = std.log.scoped(.client);
 
 pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
@@ -22,28 +21,7 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
         const Self = @This();
 
         pub const StateMachine = StateMachine_;
-
-        pub const Request = struct {
-            pub const Callback = *const fn (
-                request: *Request,
-                operation: StateMachine.Operation,
-                results: []const u8,
-            ) void;
-
-            next: ?*Request,
-            callback: ?Callback,
-            body: []const u8,
-            operation: vsr.Operation,
-            queue: union(enum) {
-                root: struct {
-                    body_total: u32,
-                    batched: FIFO(Request) = .{ .name = null },
-                },
-                link: struct {
-                    body_offset: u32,
-                },
-            },
-        };
+        pub const Request = vsr.ClientRequest;
 
         allocator: mem.Allocator,
 
@@ -223,10 +201,12 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
 
             request.* = .{
                 .next = null,
-                .callback = callback,
-                .body = event_data,
                 .operation = vsr.Operation.from(StateMachine, operation),
-                .queue = undefined,
+                .callback = callback,
+                .body_ptr = event_data.ptr,
+                .body_len = @intCast(event_data.len),
+                .queue_total = @intCast(event_data.len),
+                .queue = .{ .name = null },
             };
 
             // Check-in with the StateMachine to see if this operation should even be batched.
@@ -243,19 +223,11 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
                 while (it) |inflight| {
                     it = inflight.next;
 
-                    const root = &inflight.queue.root;
-                    if (inflight.operation.cast(StateMachine) != operation) continue;
-                    if (root.body_total + request.body.len > constants.message_body_size_max) continue;
+                    if (inflight.operation != request.operation) continue;
+                    if (inflight.queue_total + request.body_len > constants.message_body_size_max) continue;
 
-                    // Set the new offset to be at the end of the current inflight's Message body.
-                    request.queue = .{
-                        .link = .{
-                            .body_offset = root.body_total,
-                        },
-                    };
-
-                    root.body_total += @intCast(request.body.len);
-                    root.batched.push(request);
+                    inflight.queue_total += request.body_len;
+                    inflight.queue.push(request);
                     return;
                 }
             }
@@ -263,12 +235,7 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
             // Make sure to register before pushing a new Request to the request_queue.
             self.register();
 
-            request.queue = .{
-                .root = .{
-                    .body_total = @intCast(request.body.len),
-                },
-            };
-
+            // Push the request as a root node and try to send it out.
             const was_empty = self.request_queue.empty();
             self.request_queue.push(request);
             if (was_empty) self.send_request_for_the_first_time(request);
@@ -395,20 +362,15 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
             // Ignore callback processing if the Request was from register().
             if (inflight.operation == .register) {
                 assert(inflight.callback == null);
-                assert(inflight.body.len == 0);
-                assert(inflight.queue.root.batched.empty());
+                assert(inflight.body_len == 0);
+                assert(inflight.queue.empty());
                 return;
             }
 
             // Push the root as first to its batched list to keep demux processing simpler.
             // Use a copy of `batched` list as `inflight` is invalidated on the first callback.
-            var batched = inflight.queue.root.batched;
+            var batched = inflight.queue;
             batched.push_front(inflight);
-            inflight.queue = .{
-                .link = .{
-                    .body_offset = 0,
-                },
-            };
 
             assert(!inflight.operation.vsr_reserved());
             switch (inflight.operation.cast(StateMachine)) {
@@ -417,15 +379,16 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
                         std.mem.bytesAsSlice(StateMachine.Result(operation), reply.body()),
                     );
 
+                    var body_offset: u32 = 0;
                     while (batched.pop()) |request| {
                         assert(request.callback != null);
-                        assert(request.body.len > 0);
                         assert(request.operation.cast(StateMachine) == operation);
-                        assert(request.queue == .link);
+                        assert(request.body_len > 0);
 
                         const event_size = @sizeOf(StateMachine.Event(operation));
-                        const event_count = @divExact(request.body.len, event_size);
-                        const event_offset = @divExact(request.queue.link.body_offset, event_size);
+                        const event_count = @divExact(request.body_len, event_size);
+                        const event_offset = @divExact(body_offset, event_size);
+                        body_offset += request.body_len;
 
                         // Extract/use the Demux node info to slice the results from the reply.
                         const decoded = demuxer.decode(@intCast(event_offset), @intCast(event_count));
@@ -434,7 +397,8 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
                             assert(response.len == reply.body().len);
                         }
 
-                        request.callback.?(request, request.operation.cast(StateMachine), response);
+                        const callback = request.callback orelse unreachable;
+                        callback(request, response);
                     }
                 },
             }
@@ -502,14 +466,12 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
             const request = &self.request_register;
             request.* = .{
                 .next = null,
-                .callback = null,
-                .body = &.{},
                 .operation = .register,
-                .queue = .{
-                    .root = .{
-                        .body_total = 0,
-                    },
-                },
+                .callback = null,
+                .body_ptr = undefined,
+                .body_len = 0,
+                .queue_total = 0,
+                .queue = .{ .name = null },
             };
 
             assert(self.request_queue.empty());
@@ -575,24 +537,27 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
             self.request_number += 1;
 
             // First, copy the root Request's body into the message.
-            assert(request.body.len > 0 or request.operation == .register);
-            message.header.size += @intCast(request.body.len);
-            stdx.copy_disjoint(.exact, u8, message.body(), request.body);
+            assert(request.body_len > 0 or request.operation == .register);
+            message.header.size += @intCast(request.body_len);
+            stdx.copy_disjoint(.exact, u8, message.body(), request.body_ptr[0..request.body_len]);
 
             // Then, copy the body's of batched Requests into the message.
-            var it = request.queue.root.batched.peek();
+            var body_offset: usize = request.body_len;
+            var it = request.queue.peek();
             while (it) |batched| {
                 it = batched.next;
 
-                const body_offset = batched.queue.link.body_offset;
+                const body = batched.body_ptr[0..batched.body_len];
                 assert(body_offset == message.body().len);
 
-                message.header.size += @intCast(batched.body.len);
+                message.header.size += @intCast(body.len);
                 assert(message.header.size <= constants.message_size_max);
-                stdx.copy_disjoint(.exact, u8, message.body()[body_offset..], batched.body);
+
+                stdx.copy_disjoint(.exact, u8, message.body()[body_offset..], body);
+                body_offset += body.len;
             }
 
-            assert(message.body().len == request.queue.root.body_total);
+            assert(message.body().len == request.queue_total);
             assert(message.header.size <= constants.message_size_max);
 
             log.debug("{}: request: request={} size={} {s}", .{
@@ -851,8 +816,9 @@ test "Client Batching" {
         client: VSRClient,
         requests_created: u32 = 0,
 
-        /// Tracks highest Submission.user_id which completed in its callback.
+        /// Tracks highest Submission.user_id which completed in its callback & number completed.
         var highest_user_id: u128 = 0;
+        var requests_completed: usize = 0;
 
         const Request = struct {
             vsr_request: VSRClient.Request,
@@ -878,16 +844,17 @@ test "Client Batching" {
             const callback = struct {
                 pub fn callback(
                     vsr_request: *VSRClient.Request,
-                    operation: StateMachine.Operation,
                     reply: []const u8,
                 ) void {
                     const request = @fieldParentPtr(Request, "vsr_request", vsr_request);
+                    const operation = vsr_request.operation.cast(VSRClient.StateMachine);
                     const user_id = request.user_id;
                     allocator.destroy(request);
 
                     assert(operation == submission.operation);
                     assert(user_id == submission.user_id);
                     highest_user_id = @max(highest_user_id, user_id);
+                    requests_completed += 1;
 
                     const result_size = @sizeOf(StateMachine.Result(submission.operation));
                     assert(reply.len == result_size * submission.event_count);
@@ -984,7 +951,7 @@ test "Client Batching" {
         .requests_created = 0,
     });
 
-    while (Context.highest_user_id != last_user_id) {
-        ctx.client.tick();
-    }
+    while (Context.requests_completed < last_user_id) ctx.client.tick();
+    assert(Context.requests_completed == last_user_id);
+    assert(Context.highest_user_id == last_user_id);
 }

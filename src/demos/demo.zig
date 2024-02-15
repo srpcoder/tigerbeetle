@@ -38,7 +38,6 @@ pub fn request(
     batch: anytype,
     on_reply: *const fn (
         vsr_request: *Client.Request,
-        operation: StateMachine.Operation,
         results: []const u8,
     ) void,
 ) !void {
@@ -82,44 +81,36 @@ pub fn request(
 
 pub fn on_create_accounts(
     vsr_request: *Client.Request,
-    operation: StateMachine.Operation,
     results: []const u8,
 ) void {
     _ = vsr_request;
-    _ = operation;
 
     print_results(CreateAccountsResult, results);
 }
 
 pub fn on_lookup_accounts(
     vsr_request: *Client.Request,
-    operation: StateMachine.Operation,
     results: []const u8,
 ) void {
     _ = vsr_request;
-    _ = operation;
 
     print_results(Account, results);
 }
 
 pub fn on_lookup_transfers(
     vsr_request: *Client.Request,
-    operation: StateMachine.Operation,
     results: []const u8,
 ) void {
     _ = vsr_request;
-    _ = operation;
 
     print_results(Transfer, results);
 }
 
 pub fn on_create_transfers(
     vsr_request: *Client.Request,
-    operation: StateMachine.Operation,
     results: []const u8,
 ) void {
     _ = vsr_request;
-    _ = operation;
 
     print_results(CreateTransfersResult, results);
 }
