@@ -9,6 +9,7 @@ const MessagePool = message_pool.MessagePool;
 const Message = MessagePool.Message;
 
 const AOF = @import("aof.zig").AOF;
+const RingBuffer = @import("../ring_buffer.zig").RingBuffer;
 const Storage = @import("storage.zig").Storage;
 const StorageFaultAtlas = @import("storage.zig").ClusterFaultAtlas;
 const Time = @import("time.zig").Time;
@@ -61,6 +62,10 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
         pub const StateChecker = StateCheckerType(Client, Replica);
         pub const ManifestChecker = ManifestCheckerType(StateMachine.Forest);
 
+        const ClientQueue = RingBuffer(*Message.Request, .{
+            .array = constants.client_request_queue_max,
+        });
+
         pub const Options = struct {
             cluster_id: u128,
             replica_count: u8,
@@ -100,6 +105,7 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
         standby_count: u8,
 
         clients: []Client,
+        client_queues: []ClientQueue,
         client_pools: []MessagePool,
         client_id_permutation: IdPermutation,
 
@@ -240,6 +246,11 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
             }
             errdefer for (clients) |*client| client.deinit(allocator);
 
+            var client_queues = try allocator.alloc(ClientQueue, clients.len);
+            errdefer allocator.free(client_queues);
+
+            for (client_queues) |*queue| queue.* = ClientQueue.init();
+
             var state_checker = try StateChecker.init(allocator, .{
                 .cluster_id = options.cluster_id,
                 .replicas = replicas,
@@ -296,6 +307,7 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
                 .replica_count = options.replica_count,
                 .standby_count = options.standby_count,
                 .clients = clients,
+                .client_queues = client_queues,
                 .client_pools = client_pools,
                 .client_id_permutation = client_id_permutation,
                 .state_checker = state_checker,
@@ -341,6 +353,7 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
 
             cluster.grid_checker.deinit(); // (Storage references this.)
 
+            cluster.allocator.free(cluster.client_queues);
             cluster.allocator.free(cluster.clients);
             cluster.allocator.free(cluster.client_pools);
             cluster.allocator.free(cluster.replicas);
@@ -444,6 +457,7 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
             request_message: *Message,
             request_body_size: usize,
         ) void {
+            const queue = &cluster.client_queues[client_index];
             const client = &cluster.clients[client_index];
             const message = request_message.build(.request);
 
@@ -457,15 +471,17 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
                 .size = @intCast(@sizeOf(vsr.Header) + request_body_size),
             };
 
-            client.raw_request(
-                undefined,
-                request_callback,
-                message,
-            );
+            const was_empty = queue.empty();
+            queue.push_assume_capacity(message);
+
+            if (was_empty) {
+                const user_data: u128 = @bitCast([_]usize{ @intFromPtr(cluster), client_index });
+                client.raw_request(request_callback, user_data, message);
+            }
         }
 
-        /// The `request_callback` is not used — Cluster uses `Client.on_reply_{context,callback}`
-        /// instead because:
+        /// The `request_callback` is not used to process the result, only update client_queues.
+        /// Cluster uses `Client.on_reply_{context,callback}` instead because:
         /// - Cluster needs access to the request
         /// - Cluster needs access to the reply message (not just the body)
         /// - Cluster needs to know about command=register messages
@@ -476,9 +492,22 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
             operation: StateMachine.Operation,
             result: []const u8,
         ) void {
-            _ = user_data;
-            _ = operation;
             _ = result;
+
+            const data: [2]usize = @bitCast(user_data);
+            const cluster: *Self = @ptrFromInt(data[0]);
+            const client_index = data[1];
+
+            const client = &cluster.clients[client_index];
+            const queue = &cluster.client_queues[client_index];
+
+            const message = queue.pop().?;
+            assert(message.header.operation.cast(StateMachine) == operation);
+
+            // Process the next message that was enqueued if any.
+            if (queue.head()) |next_message| {
+                client.raw_request(request_callback, user_data, next_message);
+            }
         }
 
         fn client_on_reply(

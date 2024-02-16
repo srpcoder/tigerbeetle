@@ -397,8 +397,8 @@ pub const Simulator = struct {
         assert(simulator.core.count() > 0);
         assert(simulator.requests_sent == simulator.options.requests_max);
         assert(simulator.reply_sequence.empty());
-        for (simulator.cluster.clients) |*client| {
-            assert(client.request_queue.count == 0);
+        for (simulator.cluster.client_queues) |*queue| {
+            assert(queue.count == 0);
         }
 
         for (simulator.cluster.replicas) |*replica| {
@@ -718,17 +718,18 @@ pub const Simulator = struct {
 
         const client_index =
             simulator.random.uintLessThan(usize, simulator.options.cluster.client_count);
-        var client = &simulator.cluster.clients[client_index];
+        const client = &simulator.cluster.clients[client_index];
+        const queue = &simulator.cluster.client_queues[client_index];
 
         // Messages aren't added to the ReplySequence until a reply arrives.
         // Before sending a new message, make sure there will definitely be room for it.
         var reserved: usize = 0;
-        for (simulator.cluster.clients) |*c| {
+        for (simulator.cluster.clients, simulator.cluster.client_queues) |*c, *q| {
             // Count the number of clients that are still waiting for a `register` to complete,
             // since they may start one at any time.
             reserved += @intFromBool(c.session == 0);
             // Count the number of requests queued.
-            reserved += c.request_queue.count;
+            reserved += q.count;
         }
         // +1 for the potential request — is there room in the sequencer's queue?
         if (reserved + 1 > simulator.reply_sequence.free()) return;
@@ -750,9 +751,9 @@ pub const Simulator = struct {
             request_message,
             request_metadata.size,
         );
-        // Since we already checked the client's request queue for free space, `client.request()`
+        // Since we already checked the client's inflight for free space, `client.request()`
         // should always queue the request.
-        assert(request_message == client.request_queue.tail_ptr().?.message.base());
+        assert(request_message == queue.head().?.base());
         assert(request_message.header.size == @sizeOf(vsr.Header) + request_metadata.size);
         assert(request_message.header.into(.request).?.operation.cast(StateMachine) ==
             request_metadata.operation);

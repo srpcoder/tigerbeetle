@@ -243,7 +243,7 @@ pub fn ContextType(
             }
         }
 
-        pub fn request(self: *Context, packet: *Packet) Client.BatchError!void {
+        pub fn request(self: *Context, packet: *Packet) error{TooManyOutstanding}!void {
             // Get the size of each request structure in the packet.data:
             const event_size: usize = operation_event_size(packet.operation) orelse {
                 return self.on_complete(packet, error.InvalidOperation);
@@ -260,21 +260,20 @@ pub fn ContextType(
                 return self.on_complete(packet, error.TooMuchData);
             }
 
-            const batch = try self.client.batch_get(
-                @enumFromInt(packet.operation),
-                @divExact(readable.len, event_size),
-            );
-
-            stdx.copy_disjoint(.exact, u8, batch.slice(), readable);
+            // TODO: Client batching and Demuxing.
+            if (self.client.inflight_message() != null) {
+                return error.TooManyOutstanding;
+            }
 
             // Submit the message for processing:
-            self.client.batch_submit(
+            self.client.request(
+                Context.on_result,
                 @bitCast(UserData{
                     .self = self,
                     .packet = packet,
                 }),
-                Context.on_result,
-                batch,
+                @enumFromInt(packet.operation),
+                readable,
             );
         }
 
