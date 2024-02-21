@@ -286,35 +286,20 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
                 const source_index_blocks = blocks[0..10];
 
-                const source_value_pipeline_0_level_a = blocks[10..][0..10];
-                const source_value_pipeline_0_level_b = blocks[20..][0..10];
-                const source_value_pipeline_1_level_a = blocks[30..][0..10];
-                const source_value_pipeline_1_level_b = blocks[40..][0..10];
+                const source_value_level_a = blocks[10..][0..10];
+                const source_value_level_b = blocks[20..][0..10];
 
-                const output_value_pipeline_0 = blocks[50..][0..10];
-                const output_value_pipeline_1 = blocks[60..][0..10];
+                const target_value_blocks = blocks[30..][0..10];
 
                 const source_value_blocks = .{
-                    .{ source_value_pipeline_0_level_a, source_value_pipeline_0_level_b },
-                    .{ source_value_pipeline_1_level_a, source_value_pipeline_1_level_b },
-                };
-                const target_value_blocks = .{ output_value_pipeline_0, output_value_pipeline_1 };
-                const source_value_blocks_max = .{
-                    .{ source_value_pipeline_0_level_a.len, source_value_pipeline_0_level_b.len },
-                    .{ source_value_pipeline_1_level_a.len, source_value_pipeline_1_level_b.len },
-                };
-                const target_value_blocks_max = .{
-                    output_value_pipeline_0.len,
-                    output_value_pipeline_1.len,
+                    source_value_level_a,
+                    source_value_level_b,
                 };
 
                 return .{
                     .source_index_blocks = source_index_blocks,
                     .source_value_blocks = source_value_blocks,
                     .target_value_blocks = target_value_blocks,
-
-                    .source_value_blocks_max = source_value_blocks_max,
-                    .target_value_blocks_max = target_value_blocks_max,
                 };
             }
 

@@ -74,21 +74,16 @@ pub const CompactionInfo = struct {
     target_key_max: u128,
 };
 
-// FIXME: Change input / output to source / target
 pub const CompactionBlocks = struct {
     /// Index blocks are global, and shared between blips.
     /// FIXME: This complicates things somewhat.
     source_index_blocks: []BlockPtr,
 
-    /// For each split, for each input level, we have a buffer of blocks.
-    source_value_blocks: [2][2][]BlockPtr,
+    /// For each source level, we have a buffer of blocks.
+    source_value_blocks: [2][]BlockPtr,
 
-    /// For each split we have a buffer of blocks.
-    target_value_blocks: [2][]BlockPtr,
-
-    // Used to reset source_value_blocks and target_value_blocks when we change their length.
-    source_value_blocks_max: [2][2]usize,
-    target_value_blocks_max: [2]usize,
+    /// We only have one stream of output blocks.
+    target_value_blocks: []BlockPtr,
 };
 
 pub const Exhausted = struct { bar: bool, beat: bool };
@@ -811,13 +806,6 @@ pub fn CompactionType(
                 blocks.source_index_blocks.len + blocks.source_value_blocks[0][0].len + blocks.source_value_blocks[0][1].len + blocks.source_value_blocks[1][0].len + blocks.source_value_blocks[1][1].len <= grid_reads.len,
             );
             assert(bar.output_index_blocks[0].len + bar.output_index_blocks[1].len + blocks.target_value_blocks[0].len + blocks.target_value_blocks[1].len <= grid_writes.len);
-
-            assert(blocks.source_value_blocks[0][0].len == blocks.source_value_blocks_max[0][0]);
-            assert(blocks.source_value_blocks[0][1].len == blocks.source_value_blocks_max[0][1]);
-            assert(blocks.source_value_blocks[1][0].len == blocks.source_value_blocks_max[1][0]);
-            assert(blocks.source_value_blocks[0][1].len == blocks.source_value_blocks_max[0][1]);
-            assert(blocks.target_value_blocks[0].len == blocks.target_value_blocks_max[0]);
-            assert(blocks.target_value_blocks[1].len == blocks.target_value_blocks_max[1]);
         }
 
         // Our blip pipeline is 3 stages long, and split into read, merge and write stages. The
