@@ -24,6 +24,9 @@ const checkpoint_3 = vsr.Checkpoint.checkpoint_after(checkpoint_2);
 const checkpoint_1_trigger = vsr.Checkpoint.trigger_for_checkpoint(checkpoint_1).?;
 const checkpoint_2_trigger = vsr.Checkpoint.trigger_for_checkpoint(checkpoint_2).?;
 const checkpoint_3_trigger = vsr.Checkpoint.trigger_for_checkpoint(checkpoint_3).?;
+const checkpoint_1_prepare_max = vsr.Checkpoint.prepare_max_for_checkpoint(checkpoint_1).?;
+const checkpoint_2_prepare_max = vsr.Checkpoint.prepare_max_for_checkpoint(checkpoint_2).?;
+const checkpoint_3_prepare_max = vsr.Checkpoint.prepare_max_for_checkpoint(checkpoint_3).?;
 const log_level = std.log.Level.err;
 
 // TODO Test client eviction once it no longer triggers a client panic.
@@ -467,26 +470,25 @@ test "Cluster: repair: view-change, new-primary lagging behind checkpoint, forfe
 
     b1.drop_all(.__, .bidirectional);
 
-    try c.request(checkpoint_1_trigger - 1, checkpoint_1_trigger - 1);
-    try expectEqual(a0.commit(), checkpoint_1_trigger - 1);
-    try expectEqual(b1.commit(), 20);
-    try expectEqual(b2.commit(), checkpoint_1_trigger - 1);
-
-    b2.drop(.__, .incoming, .commit);
-    try c.request(checkpoint_1_trigger + 1, checkpoint_1_trigger + 1);
+    try c.request(checkpoint_1_prepare_max + 1, checkpoint_1_prepare_max + 1);
     try expectEqual(a0.op_checkpoint(), checkpoint_1);
     try expectEqual(b1.op_checkpoint(), 0);
     try expectEqual(b2.op_checkpoint(), checkpoint_1);
-    try expectEqual(a0.commit(), checkpoint_1_trigger + 1);
+    try expectEqual(a0.commit(), checkpoint_1_prepare_max + 1);
     try expectEqual(b1.commit(), 20);
-    try expectEqual(b2.commit(), checkpoint_1_trigger);
+    try expectEqual(b2.commit(), checkpoint_1_prepare_max + 1);
+    try expectEqual(a0.op_head(), checkpoint_1_prepare_max + 1);
+    try expectEqual(b1.op_head(), 20);
+    try expectEqual(b2.op_head(), checkpoint_1_prepare_max + 1);
 
     // Partition the primary, but restore B1. B1 will attempt to become the primary next,
     // but it is too far behind, so B2 becomes the new primary instead.
     b2.pass_all(.__, .bidirectional);
     b1.pass_all(.__, .bidirectional);
     a0.drop_all(.__, .bidirectional);
-    // TODO: Explicit coverage marks: This should hit the
+    // Block state sync to prove that B1 recovers via WAL repair.
+    b1.drop(.__, .bidirectional, .sync_checkpoint);
+    // TODO: Explicit coverage marks: B1 should hit the
     // "on_do_view_change: lagging primary; forfeiting" log line.
     t.run();
 
@@ -498,10 +500,10 @@ test "Cluster: repair: view-change, new-primary lagging behind checkpoint, forfe
     // Thanks to the new primary, the lagging backup is able to catch up to the latest
     // checkpoint/commit.
     try expectEqual(b1.role(), .backup);
-    try expectEqual(b1.commit(), checkpoint_1_trigger + 1);
+    try expectEqual(b1.commit(), checkpoint_1_prepare_max + 1);
     try expectEqual(b1.op_checkpoint(), checkpoint_1);
 
-    try expectEqual(t.replica(.R_).commit(), checkpoint_1_trigger + 1);
+    try expectEqual(t.replica(.R_).commit(), checkpoint_1_prepare_max + 1);
 }
 
 test "Cluster: repair: crash, corrupt committed pipeline op, repair it, view-change; dont nack" {
@@ -855,6 +857,63 @@ test "Cluster: view-change: primary with dirty log" {
     // try expectEqual(b2.status(), .normal);
 }
 
+test "Cluster: view-change: nack older view" {
+    // a0 prepares (but does not commit) three ops (`x`, `x + 1`, `x + 2`) at view `v`.
+    // b1 prepares (but does not commit) the same ops at view `v + 1`.
+    // b2 receives only `x + 2` op prepared at b1.
+    // b1 gets permanently partitioned from the cluster, and a0 and b2 form a core.
+    //
+    // a0 and b2 and should be able to truncate all the prepared, but uncommitted ops.
+    const t = try TestContext.init(.{ .replica_count = 3 });
+    defer t.deinit();
+
+    var c = t.clients(0, t.cluster.clients.len);
+    try c.request(checkpoint_1_trigger, checkpoint_1_trigger);
+    try expectEqual(t.replica(.R_).commit(), checkpoint_1_trigger);
+
+    var a0 = t.replica(.A0);
+    var b1 = t.replica(.B1);
+    var b2 = t.replica(.B2);
+
+    try expectEqual(a0.role(), .primary);
+    t.replica(.R_).drop_all(.R_, .bidirectional);
+    try c.request(checkpoint_1_trigger + 3, checkpoint_1_trigger);
+    try expectEqual(a0.op_head(), checkpoint_1_trigger + 3);
+
+    b1.pass(.R_, .bidirectional, .start_view_change);
+    b1.pass(.R_, .incoming, .do_view_change);
+    b1.pass(.R_, .outgoing, .start_view);
+    a0.drop_all(.R_, .bidirectional);
+    b2.pass(.R_, .incoming, .prepare);
+    b2.filter(.R_, .incoming, struct {
+        fn drop_message(message: *Message) bool {
+            switch (message.into_any()) {
+                .prepare => |prepare| {
+                    return (prepare.header.op < checkpoint_1_trigger + 3);
+                },
+                else => return false,
+            }
+        }
+    }.drop_message);
+
+    t.run();
+    try expectEqual(b1.role(), .primary);
+    try expectEqual(b1.status(), .normal);
+
+    try expectEqual(t.replica(.R_).op_head(), checkpoint_1_trigger + 3);
+    try expectEqual(t.replica(.R_).commit_max(), checkpoint_1_trigger);
+
+    a0.pass_all(.R_, .bidirectional);
+    b2.pass_all(.R_, .bidirectional);
+    b2.filter(.R_, .incoming, null);
+    b1.drop_all(.R_, .bidirectional);
+
+    try c.request(checkpoint_1_trigger + 3, checkpoint_1_trigger + 3);
+    try expectEqual(b2.commit_max(), checkpoint_1_trigger + 3);
+    try expectEqual(a0.commit_max(), checkpoint_1_trigger + 3);
+    try expectEqual(b1.commit_max(), checkpoint_1_trigger);
+}
+
 test "Cluster: sync: partition, lag, sync (transition from idle)" {
     for ([_]u64{
         // Normal case: the cluster has committed atop the checkpoint trigger.
@@ -1026,21 +1085,62 @@ test "Cluster: sync: view-change with lagging replica in recovering_head" {
     try c.request(checkpoint_2_trigger, checkpoint_2_trigger);
 
     // Allow B2 to join, but partition A0 to force a view change.
-    // B1 is lagging far enough behind that it must state sync – it will transition to
+    // B2 is lagging far enough behind that it must state sync – it will transition to
     // recovering_head. Despite this, the cluster of B1/B2 should recover to normal status.
     b2.pass_all(.R_, .bidirectional);
     a0.drop_all(.R_, .bidirectional);
+
+    // When B2 rejoins, it will race between:
+    // - Discovering that it is lagging, and requesting a sync_checkpoint (which transitions B2 to
+    //   recovering_head).
+    // - Participating in a view-change with B1 (while we are still in status=normal in the original
+    //   view).
+    // For this test, we want the former to occur before the latter (since the latter would always
+    // work).
+    b2.drop(.R_, .bidirectional, .start_view_change);
+    t.run();
+    b2.pass(.R_, .bidirectional, .start_view_change);
     t.run();
 
-    try expectEqual(b1.role(), .primary);
+    // try expectEqual(b1.role(), .primary);
+    try expectEqual(b1.status(), .normal);
     try expectEqual(b2.status(), .recovering_head);
-    //try expectEqual(t.replica(.R_).status(), .normal);
+    // try expectEqual(t.replica(.R_).status(), .normal);
     try expectEqual(t.replica(.R_).sync_status(), .idle);
     try expectEqual(b2.commit(), checkpoint_2);
     // try expectEqual(t.replica(.R_).commit(), checkpoint_2_trigger);
     try expectEqual(t.replica(.R_).op_checkpoint(), checkpoint_2);
 
     // try TestReplicas.expect_sync_done(t.replica(.R_));
+}
+
+test "Cluster: prepare beyond checkpoint trigger" {
+    const t = try TestContext.init(.{ .replica_count = 3 });
+    defer t.deinit();
+
+    var c = t.clients(0, t.cluster.clients.len);
+    try c.request(20, 20);
+
+    try c.request(checkpoint_1_trigger - 1, checkpoint_1_trigger - 1);
+    try expectEqual(t.replica(.R_).commit(), checkpoint_1_trigger - 1);
+
+    // Temporarily drop acks so that requests may prepare but not commit.
+    // (And to make sure we don't start checkpointing until we have had a chance to assert the
+    // cluster's state.)
+    t.replica(.R_).drop(.__, .bidirectional, .prepare_ok);
+
+    // Prepare ops beyond the checkpoint.
+    try c.request(checkpoint_1_prepare_max - 1, checkpoint_1_trigger - 1);
+    try expectEqual(t.replica(.R_).op_checkpoint(), 0);
+    try expectEqual(t.replica(.R_).commit(), checkpoint_1_trigger - 1);
+    try expectEqual(t.replica(.R_).op_head(), checkpoint_1_prepare_max - 1);
+
+    t.replica(.R_).pass(.__, .bidirectional, .prepare_ok);
+    t.run();
+    try expectEqual(c.replies(), checkpoint_1_prepare_max - 1);
+    try expectEqual(t.replica(.R_).op_checkpoint(), checkpoint_1);
+    try expectEqual(t.replica(.R_).commit(), checkpoint_1_prepare_max - 1);
+    try expectEqual(t.replica(.R_).op_head(), checkpoint_1_prepare_max - 1);
 }
 
 const ProcessSelector = enum {
@@ -1478,6 +1578,25 @@ const TestReplicas = struct {
     ) void {
         const paths = t.peer_paths(peer, direction);
         for (paths.const_slice()) |path| t.cluster.network.link_filter(path).remove(command);
+    }
+
+    pub fn filter(
+        t: *const TestReplicas,
+        peer: ProcessSelector,
+        direction: LinkDirection,
+        comptime drop_message_fn: ?fn (message: *Message) bool,
+    ) void {
+        const paths = t.peer_paths(peer, direction);
+        for (paths.const_slice()) |path| {
+            t.cluster.network.link_drop_packet_fn(path).* = if (drop_message_fn) |f|
+                &struct {
+                    fn drop_packet(packet: *const Network.Packet) bool {
+                        return f(packet.message);
+                    }
+                }.drop_packet
+            else
+                null;
+        }
     }
 
     pub fn record(

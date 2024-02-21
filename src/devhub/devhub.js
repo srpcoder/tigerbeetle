@@ -1,4 +1,4 @@
-// Code powering "developer dashboard" aka workbench, at <https://tigerbeetle.github.io>.
+// Code powering "developer dashboard" aka devhub, at <https://tigerbeetle.github.io/tigerbeetle>.
 //
 // At the moment, it isn't clear what's the right style for this kind of non-Zig developer facing
 // code, so the following is somewhat arbitrary:
@@ -47,7 +47,7 @@ function getReleaseManager() {
 }
 
 const dataUrl =
-  "https://raw.githubusercontent.com/tigerbeetle/workbenchdb/main/workbench/data.json";
+  "https://raw.githubusercontent.com/tigerbeetle/devhubdb/main/devhub/data.json";
 
 async function fetchData() {
   const data = await (await fetch(dataUrl)).text();
@@ -102,15 +102,45 @@ function plotSeries(seriesList, rootNode) {
         text: series.label,
       },
       chart: {
-        type: "bar",
+        type: "line",
         height: "400px",
+        events: {
+          dataPointSelection: (event, chartContext, { dataPointIndex }) => {
+            window.open(
+              "https://github.com/tigerbeetle/tigerbeetle/commit/" +
+                series.revision[dataPointIndex],
+            );
+          },
+        },
+      },
+      markers: {
+        size: 4,
       },
       series: [{
         name: series.label,
-        data: series.timestamp.map((t, i) => [t * 1000, series.value[i]]),
+        data: series.value,
       }],
       xaxis: {
-        type: "datetime",
+        categories: series.timestamp.map((timestamp) =>
+          new Date(timestamp * 1000).toLocaleDateString()
+        ),
+        tooltip: {
+          enabled: false,
+        },
+      },
+      tooltip: {
+        enabled: true,
+        shared: false,
+        intersect: true,
+        x: {
+          formatter: function (val, { dataPointIndex }) {
+            const timestamp = new Date(series.timestamp[dataPointIndex] * 1000);
+            const formattedDate = timestamp.toLocaleString();
+            return `<div>${
+              series.revision[dataPointIndex]
+            }</div><div>${formattedDate}</div>`;
+          },
+        },
       },
     };
 

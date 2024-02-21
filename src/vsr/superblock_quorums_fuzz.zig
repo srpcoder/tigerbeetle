@@ -109,9 +109,6 @@ fn test_quorums_working(
     const misdirect = random.boolean(); // true:cluster false:replica
     var quorums: Quorums = undefined;
     var headers: [4]SuperBlockHeader = undefined;
-    // TODO(Zig): Ideally this would be a [6]?u128 and the access would be
-    // "checksums[i] orelse random.int(u128)", but that currently causes the compiler to segfault
-    // during code generation.
     var checksums: [6]u128 = undefined;
     for (&checksums) |*c| c.* = random.int(u128);
 

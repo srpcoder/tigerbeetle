@@ -19,12 +19,14 @@ const Shell = @import("../shell.zig");
 
 const ci = @import("./ci.zig");
 const release = @import("./release.zig");
-const workbench = @import("./workbench.zig");
+const devhub = @import("./devhub.zig");
+const changelog = @import("./changelog.zig");
 
 const CliArgs = union(enum) {
     ci: ci.CliArgs,
     release: release.CliArgs,
-    workbench: workbench.CliArgs,
+    devhub: devhub.CliArgs,
+    changelog: void,
 };
 
 pub fn main() !void {
@@ -35,8 +37,6 @@ pub fn main() !void {
     };
 
     const gpa = gpa_allocator.allocator();
-    var arena_allocator = std.heap.ArenaAllocator.init(gpa);
-    defer arena_allocator.deinit();
 
     const shell = try Shell.create(gpa);
     defer shell.destroy();
@@ -49,6 +49,7 @@ pub fn main() !void {
     switch (cli_args) {
         .ci => |args_ci| try ci.main(shell, gpa, args_ci),
         .release => |args_release| try release.main(shell, gpa, args_release),
-        .workbench => |args_workbench| try workbench.main(shell, gpa, args_workbench),
+        .devhub => |args_devhub| try devhub.main(shell, gpa, args_devhub),
+        .changelog => try changelog.main(shell, gpa),
     }
 }

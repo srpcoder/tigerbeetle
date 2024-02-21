@@ -20,13 +20,13 @@ pub const Header = extern struct {
     /// This checksum is enough to uniquely identify a network message or journal entry.
     checksum: u128,
 
-    // TODO(extern u256): When Zig supports u256 in extern-structs, merge this into `checksum`.
+    // TODO(zig): When Zig supports u256 in extern-structs, merge this into `checksum`.
     checksum_padding: u128,
 
     /// A checksum covering only the associated body after this header.
     checksum_body: u128,
 
-    // TODO(extern u256): When Zig supports u256 in extern-structs, merge this into `checksum_body`.
+    // TODO(zig): When Zig supports u256 in extern-structs, merge this into `checksum_body`.
     checksum_body_padding: u128,
 
     /// Reserved for future use by AEAD.
@@ -530,13 +530,13 @@ pub const Header = extern struct {
         request_checksum_padding: u128 = 0,
         /// The id of the checkpoint where:
         ///
-        ///   prepare.op > trigger_for_checkpoint(checkpoint_op)
-        ///   prepare.op ≤ trigger_for_checkpoint(checkpoint_after(checkpoint_op))
+        ///   prepare.op > checkpoint_op
+        ///   prepare.op ≤ checkpoint_after(checkpoint_op)
         ///
         /// The purpose of including the checkpoint id is to strictly bound the number of commits
         /// that it may take to discover a divergent replica. If a replica diverges, then that
         /// divergence will be discovered *at latest* when the divergent replica attempts to commit
-        /// the first op after the next checkpoint trigger.
+        /// the first op after the next checkpoint.
         checkpoint_id: u128,
         client: u128,
         /// The op number of the latest prepare that may or may not yet be committed. Uncommitted
@@ -738,8 +738,9 @@ pub const Header = extern struct {
         replica: u8,
         reserved_frame: [16]u8 = [_]u8{0} ** 16,
 
-        parent: u128,
-        parent_padding: u128 = 0,
+        /// The checksum of the corresponding Request.
+        request_checksum: u128,
+        request_checksum_padding: u128 = 0,
         /// The checksum of the prepare message to which this message refers.
         /// This allows for cryptographic guarantees beyond request, op, and commit numbers, which
         /// have low entropy and may otherwise collide in the event of any correctness bugs.
@@ -759,7 +760,7 @@ pub const Header = extern struct {
             assert(self.command == .reply);
             // Initialization within `client.zig` asserts that client `id` is greater than zero:
             if (self.client == 0) return "client == 0";
-            if (self.parent_padding != 0) return "parent_padding != 0";
+            if (self.request_checksum_padding != 0) return "request_checksum_padding != 0";
             if (self.context_padding != 0) return "context_padding != 0";
             if (self.op != self.commit) return "op != commit";
             if (self.timestamp == 0) return "timestamp == 0";

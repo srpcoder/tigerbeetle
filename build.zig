@@ -121,6 +121,27 @@ pub fn build(b: *std.Build) !void {
         },
     });
 
+    {
+        // Run a tigerbeetle build without running codegen and waiting for llvm
+        // see <https://github.com/ziglang/zig/commit/5c0181841081170a118d8e50af2a09f5006f59e1>
+        // how it's supposed to work.
+        // In short, codegen only runs if zig build sees a dependency on the binary output of
+        // the step. So we duplicate the build definition so that it doesn't get polluted by
+        // b.installArtifact.
+        // TODO(zig): https://github.com/ziglang/zig/issues/18877
+        const tigerbeetle = b.addExecutable(.{
+            .name = "tigerbeetle",
+            .root_source_file = .{ .path = "src/tigerbeetle/main.zig" },
+            .target = target,
+            .optimize = mode,
+        });
+        tigerbeetle.addModule("vsr", vsr_module);
+        tigerbeetle.addModule("vsr_options", vsr_options_module);
+
+        const check = b.step("check", "Check if Tigerbeetle compiles");
+        check.dependOn(&tigerbeetle.step);
+    }
+
     const tigerbeetle = b.addExecutable(.{
         .name = "tigerbeetle",
         .root_source_file = .{ .path = "src/tigerbeetle/main.zig" },
@@ -158,31 +179,6 @@ pub fn build(b: *std.Build) !void {
 
         const install_step = b.getInstallStep();
         install_step.dependOn(&move_cmd.step);
-    }
-
-    {
-        const benchmark = b.addExecutable(.{
-            .name = "benchmark",
-            .root_source_file = .{ .path = "src/benchmark.zig" },
-            .target = target,
-            .optimize = mode,
-        });
-        benchmark.addModule("vsr", vsr_module);
-        benchmark.addModule("vsr_options", vsr_options_module);
-        link_tracer_backend(benchmark, git_clone_tracy, tracer_backend, target);
-
-        const install_step = b.addInstallArtifact(benchmark, .{});
-        const build_step = b.step(
-            "build_benchmark",
-            "Build TigerBeetle benchmark",
-        );
-        build_step.dependOn(&install_step.step);
-
-        const run_cmd = b.addRunArtifact(benchmark);
-        if (b.args) |args| run_cmd.addArgs(args);
-
-        const run_step = b.step("benchmark", "Run TigerBeetle benchmark");
-        run_step.dependOn(&run_cmd.step);
     }
 
     {
@@ -236,11 +232,8 @@ pub fn build(b: *std.Build) !void {
     };
 
     {
-        const test_filter = b.option(
-            []const u8,
-            "test-filter",
-            "Skip tests that do not match filter",
-        );
+        const test_filter: ?[]const u8 =
+            if (b.args != null and b.args.?.len == 1) b.args.?[0] else null;
 
         const unit_tests = b.addTest(.{
             .root_source_file = .{ .path = "src/unit_tests.zig" },
@@ -251,20 +244,6 @@ pub fn build(b: *std.Build) !void {
         unit_tests.addModule("vsr_options", vsr_options_module);
         unit_tests.step.dependOn(&tb_client_header_generate.step);
         link_tracer_backend(unit_tests, git_clone_tracy, tracer_backend, target);
-
-        // Turn on test coverage if COV env var is not blank.
-        if (std.process.getEnvVarOwned(b.allocator, "COV")) |coverage| {
-            b.allocator.free(coverage);
-            unit_tests.setExecCmd(&[_]?[]const u8{
-                "kcov",
-                "--clean",
-                "--include-path=src/",
-                "kcov-output",
-                null,
-            });
-        } else |_| {
-            // coverage not set
-        }
 
         // for src/clients/c/tb_client_header_test.zig to use cImport on tb_client.h
         unit_tests.linkLibC();

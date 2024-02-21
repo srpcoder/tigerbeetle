@@ -13,6 +13,7 @@ const constants = vsr.constants;
 const config = constants.config;
 const tracer = vsr.tracer;
 
+const benchmark_driver = @import("benchmark_driver.zig");
 const cli = @import("cli.zig");
 const fatal = vsr.flags.fatal;
 
@@ -61,6 +62,7 @@ pub fn main() !void {
         .start => |*args| try Command.start(&arena, args),
         .version => |*args| try Command.version(allocator, args.verbose),
         .repl => |*args| try Command.repl(&arena, args),
+        .benchmark => |*args| try benchmark_driver.main(allocator, args),
     }
 }
 
@@ -184,11 +186,11 @@ const Command = struct {
             .nonce = nonce,
             .time = .{},
             .state_machine_options = .{
-                // TODO Tune lsm_forest_node_count better.
-                .lsm_forest_node_count = 4096,
+                .lsm_forest_node_count = args.lsm_forest_node_count,
                 .cache_entries_accounts = args.cache_accounts,
                 .cache_entries_transfers = args.cache_transfers,
                 .cache_entries_posted = args.cache_transfers_posted,
+                .cache_entries_account_history = args.cache_account_history,
             },
             .message_bus_options = .{
                 .configuration = args.addresses,
@@ -212,11 +214,15 @@ const Command = struct {
                 node_maybe = node.next;
             }
         }
-        log_main.info("{}: Allocated {}MB in {} regions during replica init (Grid Cache: {}MB)", .{
+        log_main.info("{}: Allocated {}MB in {} regions during replica init", .{
             replica.replica,
             @divFloor(allocation_size, 1024 * 1024),
             allocation_count,
+        });
+        log_main.info("{}: Grid cache: {}MB, LSM-tree manifests: {}MB", .{
+            replica.replica,
             @divFloor(grid_cache_size, 1024 * 1024),
+            @divFloor(args.lsm_forest_node_count * constants.lsm_manifest_node_size, 1024 * 1024),
         });
 
         log_main.info("{}: cluster={}: listening on {}", .{

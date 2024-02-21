@@ -32,7 +32,11 @@ const CliArgs = union(enum) {
         cache_transfers: flags.ByteSize = .{ .bytes = constants.cache_transfers_size_default },
         cache_transfers_posted: flags.ByteSize =
             .{ .bytes = constants.cache_transfers_posted_size_default },
+        cache_account_history: flags.ByteSize =
+            .{ .bytes = constants.cache_account_history_size_default },
         cache_grid: flags.ByteSize = .{ .bytes = constants.grid_cache_size_default },
+        memory_lsm_manifest: flags.ByteSize =
+            .{ .bytes = constants.lsm_manifest_memory_size_default },
 
         positional: struct {
             path: [:0]const u8,
@@ -50,6 +54,18 @@ const CliArgs = union(enum) {
         command: []const u8 = "",
     },
 
+    benchmark: struct {
+        account_count: usize = 10_000,
+        account_history: bool = false,
+        transfer_count: usize = 10_000_000,
+        query_count: usize = 100,
+        transfer_count_per_second: usize = 1_000_000,
+        print_batch_timings: bool = false,
+        id_order: Command.Benchmark.IdOrder = .sequential,
+        statsd: bool = false,
+        addresses: ?[]const u8 = null,
+    },
+
     // TODO Document --cache-accounts, --cache-transfers, --cache-transfers-posted, --limit-storage
     pub const help = fmt.comptimePrint(
         \\Usage:
@@ -60,21 +76,26 @@ const CliArgs = union(enum) {
         \\
         \\  tigerbeetle start --addresses=<addresses> [--cache-grid=<size><KB|MB|GB>] <path>
         \\
-        \\  tigerbeetle version [--version]
+        \\  tigerbeetle version [--verbose]
         \\
         \\  tigerbeetle repl --cluster=<integer> --addresses=<addresses>
         \\
+        \\  tigerbeetle benchmark [<args>]
+        \\
         \\Commands:
         \\
-        \\  format   Create a TigerBeetle replica data file at <path>.
-        \\           The --cluster and --replica arguments are required.
-        \\           Each TigerBeetle replica must have its own data file.
+        \\  format     Create a TigerBeetle replica data file at <path>.
+        \\             The --cluster and --replica arguments are required.
+        \\             Each TigerBeetle replica must have its own data file.
         \\
-        \\  start    Run a TigerBeetle replica from the data file at <path>.
+        \\  start      Run a TigerBeetle replica from the data file at <path>.
         \\
-        \\  version  Print the TigerBeetle build version and the compile-time config values.
+        \\  version    Print the TigerBeetle build version and the compile-time config values.
         \\
-        \\  repl     Enter the TigerBeetle client REPL.
+        \\  repl       Enter the TigerBeetle client REPL.
+        \\
+        \\  benchmark  Measure performance of TigerBeetle on the current hardware.
+        \\             Benchmark options and output format are subject to change.
         \\
         \\Options:
         \\
@@ -105,7 +126,13 @@ const CliArgs = union(enum) {
         \\        and should be set as large as possible.
         \\        On a machine running only TigerBeetle, this is somewhere around
         \\        (Total RAM) - 3GB (TigerBeetle) - 1GB (System), eg 12GB for a 16GB machine.
-        \\        Defaults to 1GB.
+        \\        Defaults to {[default_cache_grid_gb]d}GB.
+        \\
+        \\  --memory-lsm-manifest=<size><KB|MB|GB>
+        \\        Sets the amount of memory allocated for LSM-tree manifests. When the
+        \\        number or size of LSM-trees would become too large for their manifests to fit
+        \\        into memory the server will terminate.
+        \\        Defaults to {[default_memory_lsm_manifest_mb]d}MB.
         \\
         \\  --verbose
         \\        Print compile-time configuration along with the build version.
@@ -131,12 +158,20 @@ const CliArgs = union(enum) {
     , .{
         .default_address = constants.address,
         .default_port = constants.port,
+        .default_cache_grid_gb = @divExact(
+            constants.grid_cache_size_default,
+            1024 * 1024 * 1024,
+        ),
+        .default_memory_lsm_manifest_mb = @divExact(
+            constants.lsm_manifest_memory_size_default,
+            1024 * 1024,
+        ),
     });
 };
 
 pub const Command = union(enum) {
     pub const Start = struct {
-        addresses: []net.Address,
+        addresses: []const net.Address,
         // true when the value of `--addresses` is exactly `0`. Used to enable "magic zero" mode for
         // testing. We check the raw string rather then the parsed address to prevent triggering
         // this logic by accident.
@@ -144,16 +179,35 @@ pub const Command = union(enum) {
         cache_accounts: u32,
         cache_transfers: u32,
         cache_transfers_posted: u32,
+        cache_account_history: u32,
         storage_size_limit: u64,
         cache_grid_blocks: u32,
+        lsm_forest_node_count: u32,
         path: [:0]const u8,
     };
 
     pub const Repl = struct {
-        addresses: []net.Address,
+        addresses: []const net.Address,
         cluster: u128,
         verbose: bool,
         statements: []const u8,
+    };
+
+    pub const Benchmark = struct {
+        /// The ID order can affect the results of a benchmark significantly. Specifically,
+        /// sequential is expected to be the best (since it can take advantage of various
+        /// optimizations such as avoiding negative prefetch) while random/reversed can't.
+        pub const IdOrder = enum { sequential, random, reversed };
+
+        account_count: usize = 10_000,
+        account_history: bool = false,
+        transfer_count: usize = 10_000_000,
+        query_count: usize = 100,
+        transfer_count_per_second: usize = 1_000_000,
+        print_batch_timings: bool = false,
+        id_order: IdOrder = .sequential,
+        statsd: bool = false,
+        addresses: ?[]const net.Address = null,
     };
 
     format: struct {
@@ -167,10 +221,14 @@ pub const Command = union(enum) {
         verbose: bool,
     },
     repl: Repl,
+    benchmark: Benchmark,
 
     pub fn deinit(command: *Command, allocator: std.mem.Allocator) void {
         switch (command.*) {
             inline .start, .repl => |*cmd| allocator.free(cmd.addresses),
+            .benchmark => |*cmd| {
+                if (cmd.addresses) |addresses| allocator.free(addresses);
+            },
             else => {},
         }
         command.* = undefined;
@@ -222,6 +280,7 @@ pub fn parse_args(allocator: std.mem.Allocator, args_iterator: *std.process.ArgI
             const AccountsValuesCache = groove_config.accounts.ObjectsCache.Cache;
             const TransfersValuesCache = groove_config.transfers.ObjectsCache.Cache;
             const PostedValuesCache = groove_config.posted.ObjectsCache.Cache;
+            const AccountHistoryValuesCache = groove_config.account_history.ObjectsCache.Cache;
 
             const addresses = parse_addresses(allocator, start.addresses);
 
@@ -247,6 +306,32 @@ pub fn parse_args(allocator: std.mem.Allocator, args_iterator: *std.process.ArgI
                 );
             }
 
+            const lsm_manifest_memory = start.memory_lsm_manifest.bytes;
+            const lsm_manifest_memory_max = constants.lsm_manifest_memory_size_max;
+            const lsm_manifest_memory_min = constants.lsm_manifest_memory_size_min;
+            const lsm_manifest_memory_multiplier = constants.lsm_manifest_memory_size_multiplier;
+            if (lsm_manifest_memory > lsm_manifest_memory_max) {
+                flags.fatal("--memory-lsm-manifest: size {} exceeds maximum: {}", .{
+                    lsm_manifest_memory,
+                    lsm_manifest_memory_max,
+                });
+            }
+            if (lsm_manifest_memory < lsm_manifest_memory_min) {
+                flags.fatal("--memory-lsm-manifest: size {} is below minimum: {}", .{
+                    lsm_manifest_memory,
+                    lsm_manifest_memory_min,
+                });
+            }
+            if (lsm_manifest_memory % lsm_manifest_memory_multiplier != 0) {
+                flags.fatal(
+                    "--memory-lsm-manifest: size {} must be a multiple of size ({})",
+                    .{ lsm_manifest_memory, lsm_manifest_memory_multiplier },
+                );
+            }
+
+            const lsm_forest_node_count: u32 =
+                @intCast(@divExact(lsm_manifest_memory, constants.lsm_manifest_node_size));
+
             return Command{
                 .start = .{
                     .addresses = addresses,
@@ -267,11 +352,17 @@ pub fn parse_args(allocator: std.mem.Allocator, args_iterator: *std.process.ArgI
                         PostedValuesCache,
                         start.cache_transfers_posted,
                     ),
+                    .cache_account_history = parse_cache_size_to_count(
+                        StateMachine.AccountHistoryGrooveValue,
+                        AccountHistoryValuesCache,
+                        start.cache_account_history,
+                    ),
                     .cache_grid_blocks = parse_cache_size_to_count(
                         [constants.block_size]u8,
                         Grid.Cache,
                         start.cache_grid,
                     ),
+                    .lsm_forest_node_count = lsm_forest_node_count,
                     .path = start.positional.path,
                 },
             };
@@ -285,6 +376,25 @@ pub fn parse_args(allocator: std.mem.Allocator, args_iterator: *std.process.ArgI
                     .cluster = repl.cluster,
                     .verbose = repl.verbose,
                     .statements = repl.command,
+                },
+            };
+        },
+        .benchmark => |benchmark| {
+            const addresses = if (benchmark.addresses) |addresses|
+                parse_addresses(allocator, addresses)
+            else
+                null;
+
+            return Command{
+                .benchmark = .{
+                    .account_count = benchmark.account_count,
+                    .transfer_count = benchmark.transfer_count,
+                    .query_count = benchmark.query_count,
+                    .transfer_count_per_second = benchmark.transfer_count_per_second,
+                    .print_batch_timings = benchmark.print_batch_timings,
+                    .id_order = benchmark.id_order,
+                    .statsd = benchmark.statsd,
+                    .addresses = addresses,
                 },
             };
         },

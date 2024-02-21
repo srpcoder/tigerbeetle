@@ -72,6 +72,7 @@ pub fn ContextType(
                 .lookup_accounts,
                 .lookup_transfers,
                 .get_account_transfers,
+                .get_account_history,
             };
             inline for (allowed_operations) |operation| {
                 if (op == @intFromEnum(operation)) {
@@ -299,7 +300,7 @@ pub fn ContextType(
             assert(self.client.messages_available <= constants.client_request_queue_max);
 
             // Signal to resume sending requests that was waiting for available messages.
-            if (self.client.messages_available == 1) self.thread.signal.notify();
+            self.thread.signal.notify();
 
             const tb_client = api.context_to_client(&self.implementation);
             const bytes = result catch |err| {

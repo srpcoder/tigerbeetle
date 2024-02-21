@@ -71,7 +71,12 @@ pub fn init(
 
     // Pass `--addresses=0` to let the OS pick a port for us.
     var process = try shell.spawn_options(
-        .{ .stdin_behavior = .Pipe, .stderr_behavior = .Ignore },
+        .{
+            .stdin_behavior = .Pipe,
+            // TODO(Zig): ignoring stderr is broken in 0.11, fixed in 0.12:
+            //     https://github.com/ziglang/zig/pull/15565
+            .stderr_behavior = if (builtin.os.tag == .windows) .Inherit else .Ignore,
+        },
         "{tigerbeetle} start --cache-grid=512MB --addresses=0 {data_file}",
         .{ .tigerbeetle = tigerbeetle, .data_file = data_file },
     );
@@ -80,10 +85,20 @@ pub fn init(
     }
 
     const port = port: {
-        errdefer log.err("failed to read port number from tigerbeetle process", .{});
+        var exit_status: ?std.ChildProcess.Term = null;
+        errdefer log.err(
+            "failed to read port number from tigerbeetle process: {?}",
+            .{exit_status},
+        );
+
         var port_buf: [std.fmt.count("{}\n", .{std.math.maxInt(u16)})]u8 = undefined;
-        const port_bun_len = try process.stdout.?.readAll(&port_buf);
-        break :port try std.fmt.parseInt(u16, port_buf[0 .. port_bun_len - 1], 10);
+        const port_buf_len = try process.stdout.?.readAll(&port_buf);
+        if (port_buf_len == 0) {
+            exit_status = try process.wait();
+            return error.NoPort;
+        }
+
+        break :port try std.fmt.parseInt(u16, port_buf[0 .. port_buf_len - 1], 10);
     };
 
     var port_str: stdx.BoundedArray(u8, 8) = .{};

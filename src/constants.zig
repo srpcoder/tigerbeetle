@@ -68,6 +68,7 @@ comptime {
     //   from the previous WAL wrap until a quorum of replicas has reached that checkpoint.
     assert(vsr_checkpoint_interval + lsm_batch_multiple + pipeline_prepare_queue_max <=
         journal_slot_count);
+    assert(vsr_checkpoint_interval >= pipeline_prepare_queue_max);
     assert(vsr_checkpoint_interval >= lsm_batch_multiple);
     assert(vsr_checkpoint_interval % lsm_batch_multiple == 0);
 }
@@ -135,6 +136,10 @@ pub const cache_transfers_size_default = config.process.cache_transfers_size_def
 /// The default size of the two-phase transfers in-memory cache:
 /// This impacts the amount of memory allocated at initialization by the server.
 pub const cache_transfers_posted_size_default = config.process.cache_transfers_posted_size_default;
+
+/// The default size of historical balances in-memory cache:
+/// This impacts the amount of memory allocated at initialization by the server.
+pub const cache_account_history_size_default = config.process.cache_account_history_size_default;
 
 /// The size of the client replies zone.
 pub const client_replies_size = clients_max * message_size_max;
@@ -566,6 +571,31 @@ pub const lsm_table_data_blocks_max = table_blocks_max: {
         block_size - @sizeOf(vsr.Header),
         (checksum_size + address_size),
     );
+};
+
+/// The default size in bytes of the NodePool used for the LSM forest's manifests.
+pub const lsm_manifest_memory_size_default = lsm_manifest_memory: {
+    // TODO Tune this better.
+    const lsm_forest_node_count: u32 = 4096;
+    break :lsm_manifest_memory lsm_forest_node_count * lsm_manifest_node_size;
+};
+
+/// The maximum size in bytes of the NodePool used for the LSM forest's manifests.
+pub const lsm_manifest_memory_size_max =
+    @divFloor(std.math.maxInt(u32), lsm_manifest_memory_size_multiplier) *
+    lsm_manifest_memory_size_multiplier;
+
+/// The minimum size in bytes of the NodePool used for the LSM forest's manifests.
+pub const lsm_manifest_memory_size_min = lsm_manifest_memory_size_multiplier;
+
+/// The lsm memory size must be a multiple of this value.
+///
+/// While technically this could be equal to lsm_manifest_node_size, we set it
+/// to 1MB so it is a more obvious increment for users.
+pub const lsm_manifest_memory_size_multiplier = lsm_manifest_memory_multiplier: {
+    const lsm_manifest_memory_multiplier = 64 * lsm_manifest_node_size;
+    assert(lsm_manifest_memory_multiplier == 1024 * 1024);
+    break :lsm_manifest_memory_multiplier lsm_manifest_memory_multiplier;
 };
 
 /// The number of milliseconds between each replica tick, the basic unit of time in TigerBeetle.

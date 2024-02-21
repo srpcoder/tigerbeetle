@@ -33,6 +33,7 @@ abstract class Request<TResponse extends Batch> {
         LOOKUP_ACCOUNTS(130),
         LOOKUP_TRANSFERS(131),
         GET_ACCOUNT_TRANSFERS(132),
+        GET_ACCOUNT_HISTORY(133),
 
         ECHO_ACCOUNTS(128),
         ECHO_TRANSFERS(129);
@@ -108,14 +109,14 @@ abstract class Request<TResponse extends Batch> {
                     case CREATE_ACCOUNTS: {
                         result = replyBuffer == null ? CreateAccountResultBatch.EMPTY
                                 : new CreateAccountResultBatch(ByteBuffer.wrap(replyBuffer));
-                        checkResultLength(result);
+                        exception = checkResultLength(result);
                         break;
                     }
 
                     case CREATE_TRANSFERS: {
                         result = replyBuffer == null ? CreateTransferResultBatch.EMPTY
                                 : new CreateTransferResultBatch(ByteBuffer.wrap(replyBuffer));
-                        checkResultLength(result);
+                        exception = checkResultLength(result);
                         break;
                     }
 
@@ -123,7 +124,7 @@ abstract class Request<TResponse extends Batch> {
                     case LOOKUP_ACCOUNTS: {
                         result = replyBuffer == null ? AccountBatch.EMPTY
                                 : new AccountBatch(ByteBuffer.wrap(replyBuffer));
-                        checkResultLength(result);
+                        exception = checkResultLength(result);
                         break;
                     }
 
@@ -131,13 +132,19 @@ abstract class Request<TResponse extends Batch> {
                     case LOOKUP_TRANSFERS: {
                         result = replyBuffer == null ? TransferBatch.EMPTY
                                 : new TransferBatch(ByteBuffer.wrap(replyBuffer));
-                        checkResultLength(result);
+                        exception = checkResultLength(result);
                         break;
                     }
 
                     case GET_ACCOUNT_TRANSFERS: {
                         result = replyBuffer == null ? TransferBatch.EMPTY
                                 : new TransferBatch(ByteBuffer.wrap(replyBuffer));
+                        break;
+                    }
+
+                    case GET_ACCOUNT_HISTORY: {
+                        result = replyBuffer == null ? AccountBalanceBatch.EMPTY
+                                : new AccountBalanceBatch(ByteBuffer.wrap(replyBuffer));
                         break;
                     }
 
@@ -158,11 +165,13 @@ abstract class Request<TResponse extends Batch> {
         }
     }
 
-    final void checkResultLength(Batch result) {
+    private AssertionError checkResultLength(Batch result) {
         if (result.getLength() > requestLen) {
-            setException(new AssertionError(
+            return new AssertionError(
                     "Amount of results is greater than the amount of requests: resultLen=%d, requestLen=%d",
-                    result.getLength(), requestLen));
+                    result.getLength(), requestLen);
+        } else {
+            return null;
         }
     }
 

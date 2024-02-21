@@ -17,12 +17,10 @@ scripts/install.sh
 With TigerBeetle installed, you are ready to benchmark!
 
 ```console
-scripts/benchmark.sh
+./tigerbeetle benchmark
 ```
 
-If you're on Windows, run `.\scripts\benchmark.bat`.
-
-See comments at the top of [/src/benchmark.zig](/src/benchmark.zig)
+See comments at the top of [/src/tigerbeetle/benchmark_load.zig](/src/tigerbeetle/benchmark_load.zig)
 for exactly what we're benchmarking.
 
 *If you encounter any benchmark errors, please send us the resulting `benchmark.log`.*
@@ -60,7 +58,7 @@ zig/zig build test
 To run a single test by name:
 
 ```console
-zig/zig build test:unit -Dtest-filter="name of test"
+zig/zig build test:unit -- "name of test"
 ```
 
 To run tests with code coverage (assuming `kcov` is installed on your system):

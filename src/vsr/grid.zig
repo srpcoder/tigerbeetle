@@ -342,7 +342,6 @@ pub fn GridType(comptime Storage: type) type {
         pub fn checkpoint(grid: *Grid, callback: *const fn (*Grid) void) void {
             assert(grid.callback == .none);
             assert(grid.read_global_queue.empty());
-            grid.assert_only_repairing();
 
             {
                 assert(grid.free_set.count_reservations() == 0);
@@ -384,7 +383,6 @@ pub fn GridType(comptime Storage: type) type {
                 return; // Still writing free set blocks.
             }
             assert(grid.free_set_checkpoint.callback == .none);
-            grid.assert_only_repairing();
 
             // We are still repairing some blocks that were released at the checkpoint.
             if (!grid.blocks_missing.checkpoint_complete()) {
@@ -401,7 +399,6 @@ pub fn GridType(comptime Storage: type) type {
 
             var write_iops = grid.write_iops.iterate();
             while (write_iops.next()) |iop| {
-                assert(iop.write.repair);
                 assert(!grid.free_set.is_free(iop.write.address));
                 assert(!grid.free_set.is_released(iop.write.address));
             }
@@ -697,6 +694,9 @@ pub fn GridType(comptime Storage: type) type {
                 }
             }
 
+            // Zero sector padding.
+            @memset(block.*[header.size..vsr.sector_ceil(header.size)], 0);
+
             write.* = .{
                 .callback = callback,
                 .address = header.address,
@@ -732,6 +732,10 @@ pub fn GridType(comptime Storage: type) type {
             const write_header = schema.header_from_block(write.block.*);
             assert(write_header.size > @sizeOf(vsr.Header));
             assert(write_header.size <= constants.block_size);
+            assert(stdx.zeroed(
+                write.block.*[write_header.size..vsr.sector_ceil(write_header.size)],
+            ));
+
             grid.superblock.storage.write_sectors(
                 write_block_callback,
                 &iop.completion,
@@ -761,7 +765,9 @@ pub fn GridType(comptime Storage: type) type {
             const cache_index = grid.cache.upsert(&completed_write.address).index;
             const cache_block = &grid.cache_blocks[cache_index];
             std.mem.swap(BlockPtr, cache_block, completed_write.block);
-            @memset(completed_write.block.*, 0);
+            // This block content won't be used again. We could overwrite the entire thing, but that
+            // would be more expensive.
+            @memset(completed_write.block.*[0..@sizeOf(vsr.Header)], 0);
 
             const cache_block_header = schema.header_from_block(cache_block.*);
             assert(cache_block_header.address == completed_write.address);
@@ -1006,7 +1012,9 @@ pub fn GridType(comptime Storage: type) type {
                 if (read.cache_write) {
                     const cache_block = &grid.cache_blocks[cache_index.?];
                     std.mem.swap(BlockPtr, iop_block, cache_block);
-                    @memset(iop_block.*, 0);
+                    // This block content won't be used again. We could overwrite the entire thing,
+                    // but that would be more expensive.
+                    @memset(iop_block.*[0..@sizeOf(vsr.Header)], 0);
                     break :block cache_block;
                 } else {
                     break :block iop_block;

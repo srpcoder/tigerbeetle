@@ -1,5 +1,176 @@
 # TigerBeetle Changelog
 
+## 2024-02-19
+
+### Safety And Performance
+
+- [#1533](https://github.com/tigerbeetle/tigerbeetle/pull/1533)
+
+  DVCs implicitly nack missing prepares from old log-views.
+
+  (This partially addresses a liveness issue in the view change.)
+
+- [#1552](https://github.com/tigerbeetle/tigerbeetle/pull/1552)
+
+  When a replica joins a view by receiving an SV message, some of the SV's headers may be too far
+  ahead to insert into the journal. (That is, they are beyond the replica's checkpoint trigger.)
+
+  During a view change, those headers are now eligible to be DVC headers.
+
+  (This partially addresses a liveness issue in the view change.)
+
+- [#1560](https://github.com/tigerbeetle/tigerbeetle/pull/1560)
+
+  Fixes a bug in the C client that wasn't handling `error.TooManyOutstanding` correctly.
+
+### Internals
+
+- [#1482](https://github.com/tigerbeetle/tigerbeetle/pull/1482)
+
+  Bring back Windows tests for .Net client in CI.
+
+- [#1540](https://github.com/tigerbeetle/tigerbeetle/pull/1540)
+
+  Add script to scaffold changelog updates.
+
+- [#1542](https://github.com/tigerbeetle/tigerbeetle/pull/1542),
+  [#1553](https://github.com/tigerbeetle/tigerbeetle/pull/1553),
+  [#1559](https://github.com/tigerbeetle/tigerbeetle/pull/1559),
+  [#1561](https://github.com/tigerbeetle/tigerbeetle/pull/1561)
+
+  Improve CI/test error reporting.
+
+- [#1551](https://github.com/tigerbeetle/tigerbeetle/pull/1551)
+
+  Draw devhub graph as line graph.
+
+- [#1554](https://github.com/tigerbeetle/tigerbeetle/pull/1554)
+
+  Simplify command to run a single test.
+
+- [#1555](https://github.com/tigerbeetle/tigerbeetle/pull/1555)
+
+  Add client batching integration tests.
+
+- [#1557](https://github.com/tigerbeetle/tigerbeetle/pull/1557)
+
+  Format default values into the CLI help message.
+
+- [#1558](https://github.com/tigerbeetle/tigerbeetle/pull/1558)
+
+  Track commit timestamp to enable retrospective benchmarking in the devhub.
+
+- [#1562](https://github.com/tigerbeetle/tigerbeetle/pull/1562),
+  [#1563](https://github.com/tigerbeetle/tigerbeetle/pull/1563)
+
+  Improve CI/test performance.
+
+- [#1567](https://github.com/tigerbeetle/tigerbeetle/pull/1567)
+
+  Guarantee that the test runner correctly reports "zero tests run" when run with a filter that
+  matches no tests.
+
+### TigerTracks 🎧
+
+- [Eye Of The Tiger](https://www.youtube.com/watch?v=btPJPFnesV4)
+
+  (Hat tip to [iofthetiger](https://ziggit.dev/t/iofthetiger/3065)!)
+
+## 2024-02-12
+
+### Safety And Performance
+
+- [#1519](https://github.com/tigerbeetle/tigerbeetle/pull/1519)
+
+  Reduce checkpoint latency by checkpointing the grid concurrently with other trailers.
+
+- [#1515](https://github.com/tigerbeetle/tigerbeetle/pull/1515)
+
+  Fix a logical race condition (which was caught by an assert) when reading and writing client
+  replies concurrently.
+
+
+- [#1522](https://github.com/tigerbeetle/tigerbeetle/pull/1522)
+
+  Double check that both checksum and request number match between a request and the corresponding
+  reply.
+
+- [#1520](https://github.com/tigerbeetle/tigerbeetle/pull/1520)
+
+  Optimize fields with zero value by not adding them to an index.
+
+### Features
+
+- [#1526](https://github.com/tigerbeetle/tigerbeetle/pull/1526),
+  [#1531](https://github.com/tigerbeetle/tigerbeetle/pull/1531).
+
+  Introduce `get_account_history` operation for querying the historical balances of a given account.
+
+- [#1523](https://github.com/tigerbeetle/tigerbeetle/pull/1523)
+
+  Add helper function for generating approximately monotonic IDs to various language clients.
+
+### TigerTracks 🎧
+
+- [Musique à Grande Vitesse](https://open.spotify.com/album/0pmrBIfqDn65p4FX9ubqXn?si=aLliiV5dSOeeId57jtaHhw)
+
+## 2024-02-05
+
+### Safety And Performance
+
+- [#1489](https://github.com/tigerbeetle/tigerbeetle/pull/1489),
+  [#1496](https://github.com/tigerbeetle/tigerbeetle/pull/1496),
+  [#1501](https://github.com/tigerbeetle/tigerbeetle/pull/1501).
+
+  Harden VSR against edge cases.
+
+- [#1508](https://github.com/tigerbeetle/tigerbeetle/pull/1508),
+  [#1509](https://github.com/tigerbeetle/tigerbeetle/pull/1509).
+
+  Allows VSR to perform checkpoint steps concurrently to reduce latency spikes.
+
+- [#1505](https://github.com/tigerbeetle/tigerbeetle/pull/1505)
+
+  Removed unused indexes on account balances for a nice bump in throughput and lower memory usage.
+
+- [#1512](https://github.com/tigerbeetle/tigerbeetle/pull/1512)
+
+  Only zero-out the parts necessary for correctness of fresh storage buffers. "Defense in Depth"
+  without sacrificing performance!
+
+### Features
+
+- [#1491](https://github.com/tigerbeetle/tigerbeetle/pull/1491),
+  [#1503](https://github.com/tigerbeetle/tigerbeetle/pull/1503).
+
+  TigerBeetle's [dev workbench](https://tigerbeetle.github.io/tigerbeetle/) now also tracks
+  memory usage (RSS), throughput, and latency benchmarks over time!
+
+### Internals
+
+- [#1481](https://github.com/tigerbeetle/tigerbeetle/pull/1481),
+  [#1493](https://github.com/tigerbeetle/tigerbeetle/pull/1493),
+  [#1495](https://github.com/tigerbeetle/tigerbeetle/pull/1495),
+  [#1498](https://github.com/tigerbeetle/tigerbeetle/pull/1498).
+
+  Simplify assertions and tests for VSR and Replica.
+
+- [#1497](https://github.com/tigerbeetle/tigerbeetle/pull/1497),
+  [#1502](https://github.com/tigerbeetle/tigerbeetle/pull/1502),
+  [#1504](https://github.com/tigerbeetle/tigerbeetle/pull/1504).
+
+  .NET CI fixups
+
+- [#1485](https://github.com/tigerbeetle/tigerbeetle/pull/1485),
+  [#1499](https://github.com/tigerbeetle/tigerbeetle/pull/1499),
+  [#1504](https://github.com/tigerbeetle/tigerbeetle/pull/1504).
+
+  Spring Cleaning
+
+### TigerTracks 🎧
+
+- [Bone Dry](https://open.spotify.com/track/0adZjn5WV3b0BcZbvSi0y9)
+
 ## 2024-01-29
 
 ### Safety And Performance

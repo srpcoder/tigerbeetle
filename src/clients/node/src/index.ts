@@ -5,8 +5,10 @@ import {
   CreateAccountsError,
   CreateTransfersError,
   Operation,
-  GetAccountTransfers,
+  AccountFilter,
+  AccountBalance,
 } from './bindings'
+import { randomFillSync } from 'node:crypto'
 
 const binding: Binding = (() => {
   const { arch, platform } = process
@@ -66,8 +68,8 @@ const binding: Binding = (() => {
 export type Context = object // tb_client
 export type AccountID = bigint // u128
 export type TransferID = bigint // u128
-export type Event = Account | Transfer | AccountID | TransferID | GetAccountTransfers
-export type Result = CreateAccountsError | CreateTransfersError | Account | Transfer
+export type Event = Account | Transfer | AccountID | TransferID | AccountFilter
+export type Result = CreateAccountsError | CreateTransfersError | Account | Transfer | AccountBalance
 export type ResultCallback = (error: Error | null, results: Result[] | null) => void
 
 interface BindingInitArgs {
@@ -93,7 +95,8 @@ export interface Client {
   createTransfers: (batch: Transfer[]) => Promise<CreateTransfersError[]>
   lookupAccounts: (batch: AccountID[]) => Promise<Account[]>
   lookupTransfers: (batch: TransferID[]) => Promise<Transfer[]>
-  getAccountTransfers: (filter: GetAccountTransfers) => Promise<Transfer[]>
+  getAccountTransfers: (filter: AccountFilter) => Promise<Transfer[]>
+  getAccountHistory: (filter: AccountFilter) => Promise<AccountBalance[]>
   destroy: () => void
 }
 
@@ -129,6 +132,49 @@ export function createClient (args: ClientInitArgs): Client {
     lookupAccounts(batch) { return request(Operation.lookup_accounts, batch) },
     lookupTransfers(batch) { return request(Operation.lookup_transfers, batch) },
     getAccountTransfers(filter) { return request(Operation.get_account_transfers, [filter]) },
+    getAccountHistory(filter) { return request(Operation.get_account_history, [filter]) },
     destroy() { binding.deinit(context) },
   }
+}
+
+let idLastTimestamp = 0;
+let idLastBuffer = new DataView(new ArrayBuffer(16));
+
+/**
+ * Generates a Universally Unique and Sortable Identifier as a u128 bigint.
+ *
+ * @remarks
+ * Based on {@link https://github.com/ulid/spec}, IDs returned are guaranteed to be monotonically
+ * increasing.
+ */
+export function id(): bigint {
+  // Ensure timestamp monotonically increases and generate a new random on each new timestamp.
+  let timestamp = Date.now()
+  if (timestamp <= idLastTimestamp) {
+    timestamp = idLastTimestamp
+  } else {
+    idLastTimestamp = timestamp
+    randomFillSync(idLastBuffer)
+  }
+
+  // Increment the u80 in idLastBuffer using carry arithmetic on u32s (as JS doesn't have fast u64).
+  const littleEndian = true
+  const randomLo32 = idLastBuffer.getUint32(0, littleEndian) + 1
+  const randomHi32 = idLastBuffer.getUint32(4, littleEndian) + (randomLo32 > 0xFFFFFFFF ? 1 : 0)
+  const randomHi16 = idLastBuffer.getUint16(8, littleEndian) + (randomHi32 > 0xFFFFFFFF ? 1 : 0)
+  if (randomHi16 > 0xFFFF) {
+    throw new Error('random bits overflow on monotonic increment')
+  }
+
+  // Store the incremented random monotonic and the timestamp into the buffer.
+  idLastBuffer.setUint32(0, randomLo32 & 0xFFFFFFFF, littleEndian)
+  idLastBuffer.setUint32(4, randomHi32 & 0xFFFFFFFF, littleEndian)
+  idLastBuffer.setUint16(8, randomHi16, littleEndian) // No need to mask since checked above.
+  idLastBuffer.setUint16(10, timestamp & 0xFFFF, littleEndian) // timestamp lo.
+  idLastBuffer.setUint32(12, (timestamp >>> 16) & 0xFFFFFFFF, littleEndian) // timestamp hi.
+
+  // Then return the buffer's contents as a little-endian u128 bigint.
+  const lo = idLastBuffer.getBigUint64(0, littleEndian)
+  const hi = idLastBuffer.getBigUint64(8, littleEndian)
+  return (hi << 64n) | lo
 }

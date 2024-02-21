@@ -1,25 +1,21 @@
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Text;
 
 namespace TigerBeetle.Tests;
 
 [TestClass]
 public class IntegrationTests
 {
-    private static Client GetClient(string address, int concurrencyMax = 32) => new(0, new string[] { address }, concurrencyMax);
-
-    private static readonly Account[] accounts = new[]
+    private static Account[] GenerateAccounts() => new[]
     {
             new Account
             {
-                Id = 100,
+                Id = ID.Create(),
                 UserData128 = 1000,
                 UserData64 = 1001,
                 UserData32 = 1002,
@@ -29,15 +25,33 @@ public class IntegrationTests
             },
             new Account
             {
-                Id = 101,
+                Id = ID.Create(),
                 UserData128 = 1000,
                 UserData64 = 1001,
                 UserData32 = 1002,
                 Flags = AccountFlags.None,
                 Ledger = 1,
                 Code = 2,
-            }
-        };
+            },
+    };
+
+    // Created by the test initializer:
+    private static TBServer server = null!;
+    private static Client client = null!;
+
+    [ClassInitialize]
+    public static void Initialize(TestContext _)
+    {
+        server = new TBServer();
+        client = new Client(0, new string[] { server.Address });
+    }
+
+    [ClassCleanup]
+    public static void Cleanup()
+    {
+        client.Dispose();
+        server.Dispose();
+    }
 
     [TestMethod]
     [ExpectedException(typeof(ArgumentNullException))]
@@ -142,82 +156,71 @@ public class IntegrationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public void CreateAccount()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
+        var accounts = GenerateAccounts();
 
         var okResult = client.CreateAccount(accounts[0]);
         Assert.IsTrue(okResult == CreateAccountResult.Ok);
 
         var lookupAccount = client.LookupAccount(accounts[0].Id);
         Assert.IsNotNull(lookupAccount);
-        AssertAccount(accounts[0], lookupAccount!.Value);
+        AssertAccount(accounts[0], lookupAccount.Value);
 
         var existsResult = client.CreateAccount(accounts[0]);
         Assert.IsTrue(existsResult == CreateAccountResult.Exists);
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task CreateAccountAsync()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
+        var accounts = GenerateAccounts();
 
         var okResult = await client.CreateAccountAsync(accounts[0]);
         Assert.IsTrue(okResult == CreateAccountResult.Ok);
 
         var lookupAccount = await client.LookupAccountAsync(accounts[0].Id);
         Assert.IsNotNull(lookupAccount);
-        AssertAccount(accounts[0], lookupAccount!.Value);
+        AssertAccount(accounts[0], lookupAccount.Value);
 
         var existsResult = await client.CreateAccountAsync(accounts[0]);
         Assert.IsTrue(existsResult == CreateAccountResult.Exists);
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public void CreateAccounts()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
+        var accounts = GenerateAccounts();
 
         var results = client.CreateAccounts(accounts);
         Assert.IsTrue(results.Length == 0);
 
         var lookupAccounts = client.LookupAccounts(new[] { accounts[0].Id, accounts[1].Id });
-        AssertAccounts(lookupAccounts);
+        AssertAccounts(accounts, lookupAccounts);
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task CreateAccountsAsync()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
+        var accounts = GenerateAccounts();
 
         var results = await client.CreateAccountsAsync(accounts);
         Assert.IsTrue(results.Length == 0);
 
         var lookupAccounts = client.LookupAccounts(new[] { accounts[0].Id, accounts[1].Id });
-        AssertAccounts(lookupAccounts);
+        AssertAccounts(accounts, lookupAccounts);
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public void CreateTransfers()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
-
+        var accounts = GenerateAccounts();
         var accountResults = client.CreateAccounts(accounts);
         Assert.IsTrue(accountResults.Length == 0);
 
         var transfer = new Transfer
         {
-            Id = 1,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -225,11 +228,11 @@ public class IntegrationTests
             Code = 1,
         };
 
-        var transferResults = client.CreateTransfers(new Transfer[] { transfer });
+        var transferResults = client.CreateTransfers(new[] { transfer });
         Assert.IsTrue(transferResults.Length == 0);
 
         var lookupAccounts = client.LookupAccounts(new[] { accounts[0].Id, accounts[1].Id });
-        AssertAccounts(lookupAccounts);
+        AssertAccounts(accounts, lookupAccounts);
 
         var lookupTransfers = client.LookupTransfers(new UInt128[] { transfer.Id });
         Assert.IsTrue(lookupTransfers.Length == 1);
@@ -243,18 +246,15 @@ public class IntegrationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task CreateTransfersAsync()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
-
+        var accounts = GenerateAccounts();
         var accountResults = await client.CreateAccountsAsync(accounts);
         Assert.IsTrue(accountResults.Length == 0);
 
         var transfer = new Transfer
         {
-            Id = 1,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -262,11 +262,11 @@ public class IntegrationTests
             Code = 1,
         };
 
-        var transferResults = await client.CreateTransfersAsync(new Transfer[] { transfer });
+        var transferResults = await client.CreateTransfersAsync(new[] { transfer });
         Assert.IsTrue(transferResults.Length == 0);
 
         var lookupAccounts = client.LookupAccounts(new[] { accounts[0].Id, accounts[1].Id });
-        AssertAccounts(lookupAccounts);
+        AssertAccounts(accounts, lookupAccounts);
 
         var lookupTransfers = await client.LookupTransfersAsync(new UInt128[] { transfer.Id });
         Assert.IsTrue(lookupTransfers.Length == 1);
@@ -280,18 +280,15 @@ public class IntegrationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public void CreateTransfer()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
-
-        var results = client.CreateAccounts(accounts);
-        Assert.IsTrue(results.Length == 0);
+        var accounts = GenerateAccounts();
+        var accountResults = client.CreateAccounts(accounts);
+        Assert.IsTrue(accountResults.Length == 0);
 
         var transfer = new Transfer
         {
-            Id = 1,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -311,18 +308,15 @@ public class IntegrationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task CreateTransferAsync()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
-
-        var results = await client.CreateAccountsAsync(accounts);
-        Assert.IsTrue(results.Length == 0);
+        var accounts = GenerateAccounts();
+        var accountResults = await client.CreateAccountsAsync(accounts);
+        Assert.IsTrue(accountResults.Length == 0);
 
         var transfer = new Transfer
         {
-            Id = 1,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -342,18 +336,15 @@ public class IntegrationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public void CreatePendingTransfers()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
-
-        var results = client.CreateAccounts(accounts);
-        Assert.IsTrue(results.Length == 0);
+        var accounts = GenerateAccounts();
+        var accountResults = client.CreateAccounts(accounts);
+        Assert.IsTrue(accountResults.Length == 0);
 
         var transfer = new Transfer
         {
-            Id = 1,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -367,7 +358,7 @@ public class IntegrationTests
         Assert.IsTrue(result == CreateTransferResult.Ok);
 
         var lookupAccounts = client.LookupAccounts(new[] { accounts[0].Id, accounts[1].Id });
-        AssertAccounts(lookupAccounts);
+        AssertAccounts(accounts, lookupAccounts);
 
         Assert.AreEqual(lookupAccounts[0].CreditsPending, transfer.Amount);
         Assert.AreEqual(lookupAccounts[0].CreditsPosted, (UInt128)0);
@@ -381,7 +372,7 @@ public class IntegrationTests
 
         var postTransfer = new Transfer
         {
-            Id = 2,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -395,7 +386,7 @@ public class IntegrationTests
         Assert.IsTrue(postResult == CreateTransferResult.Ok);
 
         lookupAccounts = client.LookupAccounts(new[] { accounts[0].Id, accounts[1].Id });
-        AssertAccounts(lookupAccounts);
+        AssertAccounts(accounts, lookupAccounts);
 
         Assert.AreEqual(lookupAccounts[0].CreditsPosted, transfer.Amount);
         Assert.AreEqual(lookupAccounts[0].CreditsPending, (UInt128)0);
@@ -409,18 +400,15 @@ public class IntegrationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task CreatePendingTransfersAsync()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
-
-        var results = await client.CreateAccountsAsync(accounts);
-        Assert.IsTrue(results.Length == 0);
+        var accounts = GenerateAccounts();
+        var accountResults = await client.CreateAccountsAsync(accounts);
+        Assert.IsTrue(accountResults.Length == 0);
 
         var transfer = new Transfer
         {
-            Id = 1,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -434,7 +422,7 @@ public class IntegrationTests
         Assert.IsTrue(result == CreateTransferResult.Ok);
 
         var lookupAccounts = await client.LookupAccountsAsync(new[] { accounts[0].Id, accounts[1].Id });
-        AssertAccounts(lookupAccounts);
+        AssertAccounts(accounts, lookupAccounts);
 
         Assert.AreEqual(lookupAccounts[0].CreditsPending, transfer.Amount);
         Assert.AreEqual(lookupAccounts[0].CreditsPosted, (UInt128)0);
@@ -448,7 +436,7 @@ public class IntegrationTests
 
         var postTransfer = new Transfer
         {
-            Id = 2,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -462,7 +450,7 @@ public class IntegrationTests
         Assert.IsTrue(postResult == CreateTransferResult.Ok);
 
         lookupAccounts = await client.LookupAccountsAsync(new[] { accounts[0].Id, accounts[1].Id });
-        AssertAccounts(lookupAccounts);
+        AssertAccounts(accounts, lookupAccounts);
 
         Assert.AreEqual(lookupAccounts[0].CreditsPosted, transfer.Amount);
         Assert.AreEqual(lookupAccounts[0].CreditsPending, (UInt128)0);
@@ -476,18 +464,15 @@ public class IntegrationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public void CreatePendingTransfersAndVoid()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
-
-        var results = client.CreateAccounts(accounts);
-        Assert.IsTrue(results.Length == 0);
+        var accounts = GenerateAccounts();
+        var accountResults = client.CreateAccounts(accounts);
+        Assert.IsTrue(accountResults.Length == 0);
 
         var transfer = new Transfer
         {
-            Id = 1,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -501,7 +486,7 @@ public class IntegrationTests
         Assert.IsTrue(result == CreateTransferResult.Ok);
 
         var lookupAccounts = client.LookupAccounts(new[] { accounts[0].Id, accounts[1].Id });
-        AssertAccounts(lookupAccounts);
+        AssertAccounts(accounts, lookupAccounts);
 
         Assert.AreEqual(lookupAccounts[0].CreditsPending, transfer.Amount);
         Assert.AreEqual(lookupAccounts[0].CreditsPosted, (UInt128)0);
@@ -515,7 +500,7 @@ public class IntegrationTests
 
         var postTransfer = new Transfer
         {
-            Id = 2,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -529,7 +514,7 @@ public class IntegrationTests
         Assert.IsTrue(postResult == CreateTransferResult.Ok);
 
         lookupAccounts = client.LookupAccounts(new[] { accounts[0].Id, accounts[1].Id });
-        AssertAccounts(lookupAccounts);
+        AssertAccounts(accounts, lookupAccounts);
 
         Assert.AreEqual(lookupAccounts[0].CreditsPosted, (UInt128)0);
         Assert.AreEqual(lookupAccounts[0].CreditsPending, (UInt128)0);
@@ -543,18 +528,15 @@ public class IntegrationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task CreatePendingTransfersAndVoidAsync()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
-
-        var results = await client.CreateAccountsAsync(accounts);
-        Assert.IsTrue(results.Length == 0);
+        var accounts = GenerateAccounts();
+        var accountResults = await client.CreateAccountsAsync(accounts);
+        Assert.IsTrue(accountResults.Length == 0);
 
         var transfer = new Transfer
         {
-            Id = 1,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -568,7 +550,7 @@ public class IntegrationTests
         Assert.IsTrue(result == CreateTransferResult.Ok);
 
         var lookupAccounts = await client.LookupAccountsAsync(new[] { accounts[0].Id, accounts[1].Id });
-        AssertAccounts(lookupAccounts);
+        AssertAccounts(accounts, lookupAccounts);
 
         Assert.AreEqual(lookupAccounts[0].CreditsPending, transfer.Amount);
         Assert.AreEqual(lookupAccounts[0].CreditsPosted, (UInt128)0);
@@ -582,7 +564,7 @@ public class IntegrationTests
 
         var postTransfer = new Transfer
         {
-            Id = 2,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -596,7 +578,7 @@ public class IntegrationTests
         Assert.IsTrue(postResult == CreateTransferResult.Ok);
 
         lookupAccounts = await client.LookupAccountsAsync(new[] { accounts[0].Id, accounts[1].Id });
-        AssertAccounts(lookupAccounts);
+        AssertAccounts(accounts, lookupAccounts);
 
         Assert.AreEqual(lookupAccounts[0].CreditsPosted, (UInt128)0);
         Assert.AreEqual(lookupAccounts[0].CreditsPending, (UInt128)0);
@@ -610,18 +592,16 @@ public class IntegrationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
+
     public void CreatePendingTransfersAndVoidExpired()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
-
-        var results = client.CreateAccounts(accounts);
-        Assert.IsTrue(results.Length == 0);
+        var accounts = GenerateAccounts();
+        var accountResults = client.CreateAccounts(accounts);
+        Assert.IsTrue(accountResults.Length == 0);
 
         var transfer = new Transfer
         {
-            Id = 1,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -635,7 +615,7 @@ public class IntegrationTests
         Assert.IsTrue(result == CreateTransferResult.Ok);
 
         var lookupAccounts = client.LookupAccounts(new[] { accounts[0].Id, accounts[1].Id });
-        AssertAccounts(lookupAccounts);
+        AssertAccounts(accounts, lookupAccounts);
 
         Assert.AreEqual(lookupAccounts[0].CreditsPending, transfer.Amount);
         Assert.AreEqual(lookupAccounts[0].CreditsPosted, (UInt128)0);
@@ -652,7 +632,7 @@ public class IntegrationTests
 
         var postTransfer = new Transfer
         {
-            Id = 2,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -667,18 +647,15 @@ public class IntegrationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task CreatePendingTransfersAndVoidExpiredAsync()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
-
-        var results = await client.CreateAccountsAsync(accounts);
-        Assert.IsTrue(results.Length == 0);
+        var accounts = GenerateAccounts();
+        var accountResults = await client.CreateAccountsAsync(accounts);
+        Assert.IsTrue(accountResults.Length == 0);
 
         var transfer = new Transfer
         {
-            Id = 1,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -692,7 +669,7 @@ public class IntegrationTests
         Assert.IsTrue(result == CreateTransferResult.Ok);
 
         var lookupAccounts = await client.LookupAccountsAsync(new[] { accounts[0].Id, accounts[1].Id });
-        AssertAccounts(lookupAccounts);
+        AssertAccounts(accounts, lookupAccounts);
 
         Assert.AreEqual(lookupAccounts[0].CreditsPending, transfer.Amount);
         Assert.AreEqual(lookupAccounts[0].CreditsPosted, (UInt128)0);
@@ -710,7 +687,7 @@ public class IntegrationTests
 
         var postTransfer = new Transfer
         {
-            Id = 2,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -726,18 +703,15 @@ public class IntegrationTests
 
 
     [TestMethod]
-    [DoNotParallelize]
     public void CreateLinkedTransfers()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
-
-        var results = client.CreateAccounts(accounts);
-        Assert.IsTrue(results.Length == 0);
+        var accounts = GenerateAccounts();
+        var accountResults = client.CreateAccounts(accounts);
+        Assert.IsTrue(accountResults.Length == 0);
 
         var transfer1 = new Transfer
         {
-            Id = 1,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -748,7 +722,7 @@ public class IntegrationTests
 
         var transfer2 = new Transfer
         {
-            Id = 2,
+            Id = ID.Create(),
             CreditAccountId = accounts[1].Id,
             DebitAccountId = accounts[0].Id,
             Amount = 49,
@@ -761,7 +735,7 @@ public class IntegrationTests
         Assert.IsTrue(transferResults.All(x => x.Result == CreateTransferResult.Ok));
 
         var lookupAccounts = client.LookupAccounts(new[] { accounts[0].Id, accounts[1].Id });
-        AssertAccounts(lookupAccounts);
+        AssertAccounts(accounts, lookupAccounts);
 
         var lookupTransfers = client.LookupTransfers(new UInt128[] { transfer1.Id, transfer2.Id });
         Assert.IsTrue(lookupTransfers.Length == 2);
@@ -780,18 +754,15 @@ public class IntegrationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task CreateLinkedTransfersAsync()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
-
-        var results = await client.CreateAccountsAsync(accounts);
-        Assert.IsTrue(results.Length == 0);
+        var accounts = GenerateAccounts();
+        var accountResults = await client.CreateAccountsAsync(accounts);
+        Assert.IsTrue(accountResults.Length == 0);
 
         var transfer1 = new Transfer
         {
-            Id = 1,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -802,7 +773,7 @@ public class IntegrationTests
 
         var transfer2 = new Transfer
         {
-            Id = 2,
+            Id = ID.Create(),
             CreditAccountId = accounts[1].Id,
             DebitAccountId = accounts[0].Id,
             Amount = 49,
@@ -815,7 +786,7 @@ public class IntegrationTests
         Assert.IsTrue(transferResults.All(x => x.Result == CreateTransferResult.Ok));
 
         var lookupAccounts = await client.LookupAccountsAsync(new[] { accounts[0].Id, accounts[1].Id });
-        AssertAccounts(lookupAccounts);
+        AssertAccounts(accounts, lookupAccounts);
 
         var lookupTransfers = await client.LookupTransfersAsync(new UInt128[] { transfer1.Id, transfer2.Id });
         Assert.IsTrue(lookupTransfers.Length == 2);
@@ -835,19 +806,15 @@ public class IntegrationTests
 
 
     [TestMethod]
-    [DoNotParallelize]
     public void CreateAccountTooMuchData()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
-
-        const int TOO_MUCH_DATA = 10000;
+        const int TOO_MUCH_DATA = 10_000;
         var accounts = new Account[TOO_MUCH_DATA];
         for (int i = 0; i < TOO_MUCH_DATA; i++)
         {
             accounts[i] = new Account
             {
-                Id = Guid.NewGuid().ToUInt128(),
+                Id = ID.Create(),
                 Code = 1,
                 Ledger = 1
             };
@@ -865,19 +832,16 @@ public class IntegrationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
+
     public async Task CreateAccountTooMuchDataAsync()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
-
-        const int TOO_MUCH_DATA = 10000;
+        const int TOO_MUCH_DATA = 10_000;
         var accounts = new Account[TOO_MUCH_DATA];
         for (int i = 0; i < TOO_MUCH_DATA; i++)
         {
             accounts[i] = new Account
             {
-                Id = Guid.NewGuid().ToUInt128(),
+                Id = ID.Create(),
                 Code = 1,
                 Ledger = 1
             };
@@ -895,19 +859,15 @@ public class IntegrationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public void CreateTransferTooMuchData()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
-
-        const int TOO_MUCH_DATA = 10000;
+        const int TOO_MUCH_DATA = 10_000;
         var transfers = new Transfer[TOO_MUCH_DATA];
         for (int i = 0; i < TOO_MUCH_DATA; i++)
         {
             transfers[i] = new Transfer
             {
-                Id = Guid.NewGuid().ToUInt128(),
+                Id = ID.Create(),
                 Code = 1,
                 Ledger = 1
             };
@@ -925,21 +885,17 @@ public class IntegrationTests
     }
 
     [TestMethod]
-    [DoNotParallelize]
     public async Task CreateTransferTooMuchDataAsync()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
-
-        const int TOO_MUCH_DATA = 10000;
+        const int TOO_MUCH_DATA = 10_000;
         var transfers = new Transfer[TOO_MUCH_DATA];
         for (int i = 0; i < TOO_MUCH_DATA; i++)
         {
             transfers[i] = new Transfer
             {
-                Id = Guid.NewGuid().ToUInt128(),
-                DebitAccountId = accounts[0].Id,
-                CreditAccountId = accounts[1].Id,
+                Id = ID.Create(),
+                DebitAccountId = 1,
+                CreditAccountId = 2,
                 Code = 1,
                 Ledger = 1,
                 Amount = 100,
@@ -959,15 +915,14 @@ public class IntegrationTests
 
 
     [TestMethod]
-    [DoNotParallelize]
     public void TestGetAccountTransfers()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
+        var accounts = GenerateAccounts();
+        accounts[0].Flags |= AccountFlags.History;
+        accounts[1].Flags |= AccountFlags.History;
 
-        // Creating the accounts.
-        var createAccountErrors = client.CreateAccounts(accounts);
-        Assert.IsTrue(createAccountErrors.Length == 0);
+        var accountResults = client.CreateAccounts(accounts);
+        Assert.IsTrue(accountResults.Length == 0);
 
         // Creating a transfer.
         var transfers = new Transfer[10];
@@ -975,11 +930,11 @@ public class IntegrationTests
         {
             transfers[i] = new Transfer
             {
-                Id = (UInt128)(i + 1),
+                Id = ID.Create(),
 
                 // Swap the debit and credit accounts:
-                CreditAccountId = accounts[i % 2 == 0 ? 0 : 1].Id,
-                DebitAccountId = accounts[i % 2 == 0 ? 1 : 0].Id,
+                CreditAccountId = i % 2 == 0 ? accounts[0].Id : accounts[1].Id,
+                DebitAccountId = i % 2 == 0 ? accounts[1].Id : accounts[0].Id,
 
                 Ledger = 1,
                 Code = 2,
@@ -995,21 +950,29 @@ public class IntegrationTests
             // Querying transfers where:
             // `debit_account_id=$account1Id OR credit_account_id=$account1Id
             // ORDER BY timestamp ASC`.
-            var filter = new GetAccountTransfers
+            var filter = new AccountFilter
             {
                 AccountId = accounts[0].Id,
                 TimestampMin = 0,
                 TimestampMax = 0,
                 Limit = 8190,
-                Flags = GetAccountTransfersFlags.Credits | GetAccountTransfersFlags.Debits
+                Flags = AccountFilterFlags.Credits | AccountFilterFlags.Debits
             };
             var account_transfers = client.GetAccountTransfers(filter);
+            var account_history = client.GetAccountHistory(filter);
+
             Assert.IsTrue(account_transfers.Length == 10);
+            Assert.IsTrue(account_history.Length == account_transfers.Length);
+
             ulong timestamp = 0;
-            foreach (var transfer in account_transfers)
+            for (int i = 0; i < account_transfers.Length; i++)
             {
+                var transfer = account_transfers[i];
                 Assert.IsTrue(transfer.Timestamp > timestamp);
                 timestamp = transfer.Timestamp;
+
+                var balance = account_history[i];
+                Assert.IsTrue(balance.Timestamp == transfer.Timestamp);
             }
         }
 
@@ -1017,21 +980,29 @@ public class IntegrationTests
             // Querying transfers where:
             // `debit_account_id=$account2Id OR credit_account_id=$account2Id
             // ORDER BY timestamp DESC`.
-            var filter = new GetAccountTransfers
+            var filter = new AccountFilter
             {
                 AccountId = accounts[1].Id,
                 TimestampMin = 0,
                 TimestampMax = 0,
                 Limit = 8190,
-                Flags = GetAccountTransfersFlags.Credits | GetAccountTransfersFlags.Debits | GetAccountTransfersFlags.Reversed
+                Flags = AccountFilterFlags.Credits | AccountFilterFlags.Debits | AccountFilterFlags.Reversed
             };
             var account_transfers = client.GetAccountTransfers(filter);
+            var account_history = client.GetAccountHistory(filter);
+
             Assert.IsTrue(account_transfers.Length == 10);
+            Assert.IsTrue(account_history.Length == account_transfers.Length);
+
             ulong timestamp = ulong.MaxValue;
-            foreach (var transfer in account_transfers)
+            for (int i = 0; i < account_transfers.Length; i++)
             {
+                var transfer = account_transfers[i];
                 Assert.IsTrue(transfer.Timestamp < timestamp);
                 timestamp = transfer.Timestamp;
+
+                var balance = account_history[i];
+                Assert.IsTrue(balance.Timestamp == transfer.Timestamp);
             }
         }
 
@@ -1039,21 +1010,29 @@ public class IntegrationTests
             // Querying transfers where:
             // `debit_account_id=$account1Id
             // ORDER BY timestamp ASC`.
-            var filter = new GetAccountTransfers
+            var filter = new AccountFilter
             {
                 AccountId = accounts[0].Id,
                 TimestampMin = 0,
                 TimestampMax = 0,
                 Limit = 8190,
-                Flags = GetAccountTransfersFlags.Debits
+                Flags = AccountFilterFlags.Debits
             };
             var account_transfers = client.GetAccountTransfers(filter);
+            var account_history = client.GetAccountHistory(filter);
+
             Assert.IsTrue(account_transfers.Length == 5);
+            Assert.IsTrue(account_history.Length == account_transfers.Length);
+
             ulong timestamp = 0;
-            foreach (var transfer in account_transfers)
+            for (int i = 0; i < account_transfers.Length; i++)
             {
+                var transfer = account_transfers[i];
                 Assert.IsTrue(transfer.Timestamp > timestamp);
                 timestamp = transfer.Timestamp;
+
+                var balance = account_history[i];
+                Assert.IsTrue(balance.Timestamp == transfer.Timestamp);
             }
         }
 
@@ -1061,21 +1040,29 @@ public class IntegrationTests
             // Querying transfers where:
             // `credit_account_id=$account2Id
             // ORDER BY timestamp DESC`.
-            var filter = new GetAccountTransfers
+            var filter = new AccountFilter
             {
                 AccountId = accounts[1].Id,
                 TimestampMin = 1,
                 TimestampMax = ulong.MaxValue - 1,
                 Limit = 8190,
-                Flags = GetAccountTransfersFlags.Credits | GetAccountTransfersFlags.Reversed
+                Flags = AccountFilterFlags.Credits | AccountFilterFlags.Reversed
             };
             var account_transfers = client.GetAccountTransfers(filter);
+            var account_history = client.GetAccountHistory(filter);
+
             Assert.IsTrue(account_transfers.Length == 5);
+            Assert.IsTrue(account_history.Length == account_transfers.Length);
+
             ulong timestamp = ulong.MaxValue;
-            foreach (var transfer in account_transfers)
+            for (int i = 0; i < account_transfers.Length; i++)
             {
+                var transfer = account_transfers[i];
                 Assert.IsTrue(transfer.Timestamp < timestamp);
                 timestamp = transfer.Timestamp;
+
+                var balance = account_history[i];
+                Assert.IsTrue(balance.Timestamp == transfer.Timestamp);
             }
         }
 
@@ -1083,153 +1070,206 @@ public class IntegrationTests
             // Querying transfers where:
             // `debit_account_id=$account1Id OR credit_account_id=$account1Id
             // ORDER BY timestamp ASC LIMIT 5`.
-            var filter = new GetAccountTransfers
+            var filter = new AccountFilter
             {
                 AccountId = accounts[0].Id,
                 TimestampMin = 0,
                 TimestampMax = 0,
                 Limit = 5,
-                Flags = GetAccountTransfersFlags.Credits | GetAccountTransfersFlags.Debits
+                Flags = AccountFilterFlags.Credits | AccountFilterFlags.Debits
             };
 
             // First 5 items:
             var account_transfers = client.GetAccountTransfers(filter);
+            var account_history = client.GetAccountHistory(filter);
+
             Assert.IsTrue(account_transfers.Length == 5);
+            Assert.IsTrue(account_history.Length == account_transfers.Length);
+
             ulong timestamp = 0;
-            foreach (var transfer in account_transfers)
+            for (int i = 0; i < account_transfers.Length; i++)
             {
+                var transfer = account_transfers[i];
                 Assert.IsTrue(transfer.Timestamp > timestamp);
                 timestamp = transfer.Timestamp;
+
+                var balance = account_history[i];
+                Assert.IsTrue(balance.Timestamp == transfer.Timestamp);
             }
 
             // Next 5 items from this timestamp:
             filter.TimestampMin = timestamp + 1;
             account_transfers = client.GetAccountTransfers(filter);
+            account_history = client.GetAccountHistory(filter);
+
             Assert.IsTrue(account_transfers.Length == 5);
-            foreach (var transfer in account_transfers)
+            Assert.IsTrue(account_history.Length == account_transfers.Length);
+
+            for (int i = 0; i < account_transfers.Length; i++)
             {
+                var transfer = account_transfers[i];
                 Assert.IsTrue(transfer.Timestamp > timestamp);
                 timestamp = transfer.Timestamp;
+
+                var balance = account_history[i];
+                Assert.IsTrue(balance.Timestamp == transfer.Timestamp);
             }
 
             // No more pages after that:
             filter.TimestampMin = timestamp + 1;
             account_transfers = client.GetAccountTransfers(filter);
+            account_history = client.GetAccountHistory(filter);
+
             Assert.IsTrue(account_transfers.Length == 0);
+            Assert.IsTrue(account_history.Length == account_transfers.Length);
         }
 
         {
             // Querying transfers where:
             // `debit_account_id=$account2Id OR credit_account_id=$account2Id
             // ORDER BY timestamp DESC LIMIT 5`.
-            var filter = new GetAccountTransfers
+            var filter = new AccountFilter
             {
                 AccountId = accounts[1].Id,
                 TimestampMin = 0,
                 TimestampMax = 0,
                 Limit = 5,
-                Flags = GetAccountTransfersFlags.Credits | GetAccountTransfersFlags.Debits | GetAccountTransfersFlags.Reversed
+                Flags = AccountFilterFlags.Credits | AccountFilterFlags.Debits | AccountFilterFlags.Reversed
             };
 
             // First 5 items:
             var account_transfers = client.GetAccountTransfers(filter);
+            var account_history = client.GetAccountHistory(filter);
+
             Assert.IsTrue(account_transfers.Length == 5);
+            Assert.IsTrue(account_history.Length == account_transfers.Length);
+
             ulong timestamp = ulong.MaxValue;
-            foreach (var transfer in account_transfers)
+            for (int i = 0; i < account_transfers.Length; i++)
             {
+                var transfer = account_transfers[i];
                 Assert.IsTrue(transfer.Timestamp < timestamp);
                 timestamp = transfer.Timestamp;
+
+                var balance = account_history[i];
+                Assert.IsTrue(balance.Timestamp == transfer.Timestamp);
             }
 
             // Next 5 items from this timestamp:
             filter.TimestampMax = timestamp - 1;
             account_transfers = client.GetAccountTransfers(filter);
+            account_history = client.GetAccountHistory(filter);
+
             Assert.IsTrue(account_transfers.Length == 5);
-            foreach (var transfer in account_transfers)
+            Assert.IsTrue(account_history.Length == account_transfers.Length);
+
+            for (int i = 0; i < account_transfers.Length; i++)
             {
+                var transfer = account_transfers[i];
                 Assert.IsTrue(transfer.Timestamp < timestamp);
                 timestamp = transfer.Timestamp;
+
+                var balance = account_history[i];
+                Assert.IsTrue(balance.Timestamp == transfer.Timestamp);
             }
 
             // No more pages after that:
             filter.TimestampMax = timestamp - 1;
             account_transfers = client.GetAccountTransfers(filter);
+            account_history = client.GetAccountHistory(filter);
+
             Assert.IsTrue(account_transfers.Length == 0);
+            Assert.IsTrue(account_history.Length == account_transfers.Length);
         }
 
         {
             // Empty filter:
-            Assert.IsTrue(client.GetAccountTransfers(new GetAccountTransfers { }).Length == 0);
+            Assert.IsTrue(client.GetAccountTransfers(new AccountFilter { }).Length == 0);
+            Assert.IsTrue(client.GetAccountHistory(new AccountFilter { }).Length == 0);
 
             // Invalid account
-            Assert.IsTrue(client.GetAccountTransfers(new GetAccountTransfers
+            var filter = new AccountFilter
             {
                 AccountId = 0,
                 TimestampMin = 0,
                 TimestampMax = 0,
                 Limit = 8190,
-                Flags = GetAccountTransfersFlags.Credits | GetAccountTransfersFlags.Debits,
-            }).Length == 0);
+                Flags = AccountFilterFlags.Credits | AccountFilterFlags.Debits,
+            };
+            Assert.IsTrue(client.GetAccountTransfers(filter).Length == 0);
+            Assert.IsTrue(client.GetAccountHistory(filter).Length == 0);
 
             // Invalid timestamp min
-            Assert.IsTrue(client.GetAccountTransfers(new GetAccountTransfers
+            filter = new AccountFilter
             {
                 AccountId = accounts[0].Id,
                 TimestampMin = ulong.MaxValue,
                 TimestampMax = 0,
                 Limit = 8190,
-                Flags = GetAccountTransfersFlags.Credits | GetAccountTransfersFlags.Debits,
-            }).Length == 0);
+                Flags = AccountFilterFlags.Credits | AccountFilterFlags.Debits,
+            };
+            Assert.IsTrue(client.GetAccountTransfers(filter).Length == 0);
+            Assert.IsTrue(client.GetAccountHistory(filter).Length == 0);
 
             // Invalid timestamp max
-            Assert.IsTrue(client.GetAccountTransfers(new GetAccountTransfers
+            filter = new AccountFilter
             {
                 AccountId = accounts[0].Id,
                 TimestampMin = 0,
                 TimestampMax = ulong.MaxValue,
                 Limit = 8190,
-                Flags = GetAccountTransfersFlags.Credits | GetAccountTransfersFlags.Debits,
-            }).Length == 0);
+                Flags = AccountFilterFlags.Credits | AccountFilterFlags.Debits,
+            };
+            Assert.IsTrue(client.GetAccountTransfers(filter).Length == 0);
+            Assert.IsTrue(client.GetAccountHistory(filter).Length == 0);
 
             // Invalid timestamp range
-            Assert.IsTrue(client.GetAccountTransfers(new GetAccountTransfers
+            filter = new AccountFilter
             {
                 AccountId = accounts[0].Id,
                 TimestampMin = ulong.MaxValue - 1,
                 TimestampMax = 1,
                 Limit = 8190,
-                Flags = GetAccountTransfersFlags.Credits | GetAccountTransfersFlags.Debits,
-            }).Length == 0);
+                Flags = AccountFilterFlags.Credits | AccountFilterFlags.Debits,
+            };
+            Assert.IsTrue(client.GetAccountTransfers(filter).Length == 0);
+            Assert.IsTrue(client.GetAccountHistory(filter).Length == 0);
 
             // Zero limit
-            Assert.IsTrue(client.GetAccountTransfers(new GetAccountTransfers
+            filter = new AccountFilter
             {
                 AccountId = accounts[0].Id,
                 TimestampMin = 0,
                 TimestampMax = 0,
                 Limit = 0,
-                Flags = GetAccountTransfersFlags.Credits | GetAccountTransfersFlags.Debits,
-            }).Length == 0);
+                Flags = AccountFilterFlags.Credits | AccountFilterFlags.Debits,
+            };
+            Assert.IsTrue(client.GetAccountTransfers(filter).Length == 0);
+            Assert.IsTrue(client.GetAccountHistory(filter).Length == 0);
 
             // Empty flags
-            Assert.IsTrue(client.GetAccountTransfers(new GetAccountTransfers
+            filter = new AccountFilter
             {
                 AccountId = accounts[0].Id,
                 TimestampMin = 0,
                 TimestampMax = 0,
                 Limit = 8190,
-                Flags = (GetAccountTransfersFlags)0,
-            }).Length == 0);
+                Flags = (AccountFilterFlags)0,
+            };
+            Assert.IsTrue(client.GetAccountTransfers(filter).Length == 0);
+            Assert.IsTrue(client.GetAccountHistory(filter).Length == 0);
 
             // Invalid flags
-            Assert.IsTrue(client.GetAccountTransfers(new GetAccountTransfers
+            filter = new AccountFilter
             {
                 AccountId = accounts[0].Id,
                 TimestampMin = 0,
                 TimestampMax = 0,
                 Limit = 8190,
-                Flags = (GetAccountTransfersFlags)0xFFFF,
-            }).Length == 0);
+                Flags = (AccountFilterFlags)0xFFFF,
+            };
+            Assert.IsTrue(client.GetAccountTransfers(filter).Length == 0);
+            Assert.IsTrue(client.GetAccountHistory(filter).Length == 0);
         }
     }
 
@@ -1238,57 +1278,83 @@ public class IntegrationTests
     /// </summary>
 
     [TestMethod]
-    [DoNotParallelize]
     public void ConcurrencyTest() => ConcurrencyTest(isAsync: false);
 
     [TestMethod]
-    [DoNotParallelize]
     public void ConcurrencyTestAsync() => ConcurrencyTest(isAsync: true);
 
     private void ConcurrencyTest(bool isAsync)
     {
-        const int TASKS_QTY = 32;
-        int MAX_CONCURRENCY = 32;
+        const int TASKS_QTY = 1_000_000;
+        const int CONCURRENCY_MAX = 8192;
 
-        using var server = new TBServer();
-        using var client = GetClient(server.Address, MAX_CONCURRENCY);
+        using var client = new Client(0, new[] { server.Address }, CONCURRENCY_MAX);
 
-        var errors = client.CreateAccounts(accounts);
-        Assert.IsTrue(errors.Length == 0);
+        var accounts = GenerateAccounts();
+        var accountResults = client.CreateAccounts(accounts);
+        Assert.IsTrue(accountResults.Length == 0);
 
-        var list = new List<Task<CreateTransferResult>>();
+
+        var tasks = new Task<CreateTransferResult>[TASKS_QTY];
+        var semaphore = new SemaphoreSlim(CONCURRENCY_MAX);
+
+        async Task<CreateTransferResult> asyncAction(Transfer transfer)
+        {
+            try
+            {
+                await semaphore.WaitAsync();
+                return await client.CreateTransferAsync(transfer);
+            }
+            finally
+            {
+                _ = semaphore.Release();
+            }
+        }
+
+        CreateTransferResult syncAction(Transfer transfer)
+        {
+            try
+            {
+                semaphore.Wait();
+                return client.CreateTransfer(transfer);
+            }
+            finally
+            {
+                _ = semaphore.Release();
+            }
+        }
 
         for (int i = 0; i < TASKS_QTY; i++)
         {
             var transfer = new Transfer
             {
-                Id = (UInt128)(i + 1),
+                Id = ID.Create(),
                 CreditAccountId = accounts[0].Id,
                 DebitAccountId = accounts[1].Id,
-                Amount = 100,
+                Amount = 1,
                 Ledger = 1,
                 Code = 1,
             };
 
             /// Starts multiple tasks.
-            var task = isAsync ? client.CreateTransferAsync(transfer) : Task.Run(() => client.CreateTransfer(transfer));
-            list.Add(task);
+            var task = isAsync ? asyncAction(transfer) : Task.Run(() => syncAction(transfer));
+            tasks[i] = task;
         }
 
-        Task.WhenAll(list).Wait();
+        Task.WhenAll(tasks).Wait();
 
-        Assert.IsTrue(list.All(x => x.Result == CreateTransferResult.Ok));
+        Assert.IsTrue(tasks.All(x => x.Result == CreateTransferResult.Ok));
 
         var lookupAccounts = client.LookupAccounts(new[] { accounts[0].Id, accounts[1].Id });
-        AssertAccounts(lookupAccounts);
+        AssertAccounts(accounts, lookupAccounts);
 
         // Assert that all tasks ran to the conclusion
 
-        Assert.AreEqual(lookupAccounts[0].CreditsPosted, (ulong)(100 * TASKS_QTY));
+        Assert.AreEqual(lookupAccounts[0].CreditsPosted, (uint)TASKS_QTY);
         Assert.AreEqual(lookupAccounts[0].DebitsPosted, 0LU);
 
         Assert.AreEqual(lookupAccounts[1].CreditsPosted, 0LU);
-        Assert.AreEqual(lookupAccounts[1].DebitsPosted, (ulong)(100 * TASKS_QTY));
+        Assert.AreEqual(lookupAccounts[1].DebitsPosted, (uint)TASKS_QTY);
     }
 
     /// <summary>
@@ -1297,31 +1363,29 @@ public class IntegrationTests
     /// </summary>
 
     [TestMethod]
-    [DoNotParallelize]
     public void ConcurrencyExceededTest() => ConcurrencyExceededTest(isAsync: false);
 
     [TestMethod]
-    [DoNotParallelize]
     public void ConcurrencyExceededTestAsync() => ConcurrencyExceededTest(isAsync: true);
 
     private void ConcurrencyExceededTest(bool isAsync)
     {
         const int TASKS_QTY = 32;
-        int MAX_CONCURRENCY = 2;
+        const int CONCURRENCY_MAX = 2;
 
-        using var server = new TBServer();
-        using var client = GetClient(server.Address, MAX_CONCURRENCY);
+        using var client = new Client(0, new[] { server.Address }, CONCURRENCY_MAX);
 
-        var errors = client.CreateAccounts(accounts);
-        Assert.IsTrue(errors.Length == 0);
+        var accounts = GenerateAccounts();
+        var accountResults = client.CreateAccounts(accounts);
+        Assert.IsTrue(accountResults.Length == 0);
 
-        var list = new List<Task<CreateTransferResult>>();
+        var tasks = new Task<CreateTransferResult>[TASKS_QTY];
 
         for (int i = 0; i < TASKS_QTY; i++)
         {
             var transfer = new Transfer
             {
-                Id = (UInt128)(i + 1),
+                Id = ID.Create(),
                 CreditAccountId = accounts[0].Id,
                 DebitAccountId = accounts[1].Id,
                 Ledger = 1,
@@ -1331,29 +1395,28 @@ public class IntegrationTests
 
             /// Starts multiple tasks using a client with a limited concurrencyMax:
             var task = isAsync ? client.CreateTransferAsync(transfer) : Task.Run(() => client.CreateTransfer(transfer));
-            list.Add(task);
+            tasks[i] = task;
         }
 
         try
         {
             // Ignoring exceptions from the tasks.
-            Task.WhenAll(list).Wait();
+            Task.WhenAll(tasks).Wait();
         }
         catch { }
 
-        // It's expected for some tasks to failt with ConcurrencyExceededException or ObjectDisposedException:
-        var successCount = list.Count(x => !x.IsFaulted && x.Result == CreateTransferResult.Ok);
-        var failedCount = list.Count(x => x.IsFaulted &&
-            (AssertException<ConcurrencyExceededException>(x.Exception!) ||
-            AssertException<ObjectDisposedException>(x.Exception!)));
+        // It's expected for some tasks to fail with ConcurrencyExceededException:
+        var successCount = tasks.Count(x => !x.IsFaulted && x.Result == CreateTransferResult.Ok);
+        var failedCount = tasks.Count(x => x.IsFaulted &&
+            AssertException<ConcurrencyExceededException>(x.Exception!));
         Assert.IsTrue(successCount > 0);
         Assert.IsTrue(successCount + failedCount == TASKS_QTY);
 
         // Asserting that either the task failed or succeeded.
-        Assert.IsTrue(list.All(x => x.IsFaulted || x.Result == CreateTransferResult.Ok));
+        Assert.IsTrue(tasks.All(x => x.IsFaulted || x.Result == CreateTransferResult.Ok));
 
         var lookupAccounts = client.LookupAccounts(new[] { accounts[0].Id, accounts[1].Id });
-        AssertAccounts(lookupAccounts);
+        AssertAccounts(accounts, lookupAccounts);
 
         // Assert that all tasks ran to the conclusion
 
@@ -1370,31 +1433,29 @@ public class IntegrationTests
     /// </summary>
 
     [TestMethod]
-    [DoNotParallelize]
     public void ConcurrentTasksDispose() => ConcurrentTasksDispose(isAsync: false);
 
     [TestMethod]
-    [DoNotParallelize]
     public void ConcurrentTasksDisposeAsync() => ConcurrentTasksDispose(isAsync: true);
 
     private void ConcurrentTasksDispose(bool isAsync)
     {
         const int TASKS_QTY = 32;
-        int MAX_CONCURRENCY = 32;
+        const int CONCURRENCY_MAX = 32;
 
-        using var server = new TBServer();
-        using var client = GetClient(server.Address, MAX_CONCURRENCY);
+        using var client = new Client(0, new[] { server.Address }, CONCURRENCY_MAX);
 
-        var results = client.CreateAccounts(accounts);
-        Assert.IsTrue(results.Length == 0);
+        var accounts = GenerateAccounts();
+        var accountResults = client.CreateAccounts(accounts);
+        Assert.IsTrue(accountResults.Length == 0);
 
-        var list = new List<Task<CreateTransferResult>>();
+        var tasks = new Task<CreateTransferResult>[TASKS_QTY];
 
         for (int i = 0; i < TASKS_QTY; i++)
         {
             var transfer = new Transfer
             {
-                Id = (UInt128)(i + 1),
+                Id = ID.Create(),
                 CreditAccountId = accounts[0].Id,
                 DebitAccountId = accounts[1].Id,
                 Amount = 100,
@@ -1404,11 +1465,11 @@ public class IntegrationTests
 
             /// Starts multiple tasks.
             var task = isAsync ? client.CreateTransferAsync(transfer) : Task.Run(() => client.CreateTransfer(transfer));
-            list.Add(task);
+            tasks[i] = task;
         }
 
         // Waiting for just one task, the others may be pending.
-        list.First().Wait();
+        Task.WaitAny(tasks);
 
         // Disposes the client, waiting all placed requests to finish.
         client.Dispose();
@@ -1416,24 +1477,23 @@ public class IntegrationTests
         try
         {
             // Ignoring exceptions from the tasks.
-            Task.WhenAll(list).Wait();
+            Task.WhenAll(tasks).Wait();
         }
         catch { }
 
         // Asserting that either the task failed or succeeded,
         // at least one must be succeeded.
-        Assert.IsTrue(list.Any(x => !x.IsFaulted && x.Result == CreateTransferResult.Ok));
-        Assert.IsTrue(list.All(x => x.IsFaulted || x.Result == CreateTransferResult.Ok));
+        Assert.IsTrue(tasks.Any(x => !x.IsFaulted && x.Result == CreateTransferResult.Ok));
+        Assert.IsTrue(tasks.All(x => x.IsFaulted || x.Result == CreateTransferResult.Ok));
     }
 
     [TestMethod]
     [ExpectedException(typeof(ObjectDisposedException))]
-    [DoNotParallelize]
     public void DisposedClient()
     {
-        using var server = new TBServer();
-        using var client = GetClient(server.Address);
+        using var client = new Client(0, new[] { server.Address });
 
+        var accounts = GenerateAccounts();
         var accountResults = client.CreateAccounts(accounts);
         Assert.IsTrue(accountResults.Length == 0);
 
@@ -1441,7 +1501,7 @@ public class IntegrationTests
 
         var transfer = new Transfer
         {
-            Id = 1,
+            Id = ID.Create(),
             CreditAccountId = accounts[0].Id,
             DebitAccountId = accounts[1].Id,
             Amount = 100,
@@ -1449,17 +1509,17 @@ public class IntegrationTests
             Code = 1,
         };
 
-        _ = client.CreateTransfers(new Transfer[] { transfer });
+        _ = client.CreateTransfers(new[] { transfer });
         Assert.Fail();
     }
 
 
-    private static void AssertAccounts(Account[] lookupAccounts)
+    private static void AssertAccounts(Account[] expected, Account[] actual)
     {
-        Assert.IsTrue(lookupAccounts.Length == accounts.Length);
-        for (int i = 0; i < accounts.Length; i++)
+        Assert.AreEqual(expected.Length, actual.Length);
+        for (int i = 0; i < actual.Length; i++)
         {
-            AssertAccount(accounts[i], lookupAccounts[i]);
+            AssertAccount(actual[i], expected[i]);
         }
     }
 
@@ -1507,23 +1567,21 @@ internal class TBServer : IDisposable
     private const string PROJECT_ROOT = "../../../../..";
     private const string TB_PATH = PROJECT_ROOT + "/../../../zig-out/bin";
     private const string TB_EXE = "tigerbeetle";
-    private const string TB_FILE = "dotnet-tests.tigerbeetle";
     private const string TB_SERVER = TB_PATH + "/" + TB_EXE;
-    private const string FORMAT = $"format --cluster=0 --replica=0 --replica-count=1 ./" + TB_FILE;
-    private const string START = $"start --addresses=0 --cache-grid=512MB ./" + TB_FILE;
 
     private readonly Process process;
+    private readonly string dataFile;
 
     public string Address { get; }
 
     public TBServer()
     {
-        CleanUp();
+        dataFile = Path.GetRandomFileName();
 
         {
-            var format = new Process();
+            using var format = new Process();
             format.StartInfo.FileName = TB_SERVER;
-            format.StartInfo.Arguments = FORMAT;
+            format.StartInfo.Arguments = $"format --cluster=0 --replica=0 --replica-count=1 ./{dataFile}";
             format.StartInfo.RedirectStandardError = true;
             format.Start();
             var formatStderr = format.StandardError.ReadToEnd();
@@ -1533,7 +1591,7 @@ internal class TBServer : IDisposable
 
         process = new Process();
         process.StartInfo.FileName = TB_SERVER;
-        process.StartInfo.Arguments = START;
+        process.StartInfo.Arguments = $"start --addresses=0 --cache-grid=512MB ./{dataFile}";
         process.StartInfo.RedirectStandardInput = true;
         process.StartInfo.RedirectStandardOutput = true;
         process.Start();
@@ -1543,21 +1601,9 @@ internal class TBServer : IDisposable
 
     public void Dispose()
     {
-        CleanUp();
-    }
-
-    private void CleanUp()
-    {
-        try
-        {
-            if (process != null && !process.HasExited)
-            {
-                process.Kill();
-                process.Dispose();
-            }
-
-            File.Delete($"./{TB_FILE}");
-        }
-        catch { }
+        process.Kill();
+        process.WaitForExit();
+        process.Dispose();
+        File.Delete($"./{dataFile}");
     }
 }
