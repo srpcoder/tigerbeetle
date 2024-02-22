@@ -230,6 +230,30 @@ pub fn RingBuffer(
             return result;
         }
 
+        /// A `Slice` represents a region of a ring buffer. The region is split into two
+        /// sections as the ring buffer data will not be contiguous if the desired
+        /// region wraps to the start of the backing slice.
+        pub const Slice = struct {
+            first: []T,
+            second: []T,
+        };
+
+        /// Returns a Slice into the underlying buffer. This can be used for writing items,
+        /// combined with incrementing count manually, so bound on the underlying buffer
+        /// rather than the number of items currently in the ring buffer.
+        pub fn as_slice(self: *Self, start: usize, len: usize) Slice {
+            assert(len <= self.buffer.len);
+            assert(start <= self.buffer.len);
+
+            const first = self.buffer[start..@min(self.buffer.len, start + len)];
+            const second = self.buffer[0 .. len - first.len];
+
+            return Slice{
+                .first = first,
+                .second = second,
+            };
+        }
+
         pub const Iterator = struct {
             ring: *const Self,
             count: usize = 0,
@@ -536,19 +560,25 @@ test "value stream: foo" {
     const BlockRingBuffer = RingBuffer(BlockPtr, .slice);
 
     const allocator = std.testing.allocator;
-    const blocks: []BlockPtr = &.{};
-    var stream = BlockRingBuffer.init(blocks);
+    var blocks: [32]BlockPtr = undefined;
+    var stream = BlockRingBuffer.init(&blocks);
 
     const block_to_write = try allocate_block(allocator);
     defer allocator.free(block_to_write);
     @memset(block_to_write, 1);
 
+    const ring_slice = stream.as_slice(stream.index, 32);
+    ring_slice.first[0] = block_to_write;
+    ring_slice.first[1] = block_to_write;
+    stream.count += 2;
+
     std.log.warn("Ring buffer with {} available slots", .{stream.buffer.len - stream.count});
 
-    stream.push(block_to_write) catch unreachable;
-    std.log.warn("Ring buffer with {} available slots", .{stream.buffer.len - stream.count});
+    var block = stream.pop();
+    std.log.warn("Read: {any}", .{block});
+    block = stream.pop();
+    std.log.warn("Read: {any}", .{block});
 
-    _ = stream.pop();
     std.log.warn("Ring buffer with {} available slots", .{stream.buffer.len - stream.count});
     // stream.write_slice(&blocks_to_write);
     // const blocks_read = stream.read_slice();
