@@ -10,7 +10,8 @@ pub fn RingBuffer(
     comptime T: type,
     comptime buffer_type: union(enum) {
         array: usize, // capacity
-        slice, // (Capacity is passed to init() at runtime).
+        slice, // A pre-allocated slice is passed in.
+        dynamic, // (Capacity is passed to init() at runtime).
     },
 ) type {
     return struct {
@@ -19,11 +20,12 @@ pub fn RingBuffer(
         pub const count_max = switch (buffer_type) {
             .array => |count_max_| count_max_,
             .slice => {},
+            .dynamic => {},
         };
 
         buffer: switch (buffer_type) {
             .array => |count_max_| [count_max_]T,
-            .slice => []T,
+            .slice, .dynamic => []T,
         },
 
         /// The index of the slot with the first item, if any.
@@ -39,6 +41,11 @@ pub fn RingBuffer(
                 }
             },
             .slice => struct {
+                pub fn init(buffer: []T) Self {
+                    return .{ .buffer = buffer };
+                }
+            },
+            .dynamic => struct {
                 pub fn init(allocator: mem.Allocator, capacity: usize) !Self {
                     assert(capacity > 0);
 
@@ -400,7 +407,7 @@ test "RingBuffer: low level interface" {
     var array_ring = ArrayRing.init();
     try test_low_level_interface(ArrayRing, &array_ring);
 
-    const PointerRing = RingBuffer(u32, .slice);
+    const PointerRing = RingBuffer(u32, .dynamic);
     var pointer_ring = try PointerRing.init(testing.allocator, 2);
     defer pointer_ring.deinit(testing.allocator);
     try test_low_level_interface(PointerRing, &pointer_ring);
@@ -526,11 +533,11 @@ test "RingBuffer: count_max=0" {
 test "value stream: foo" {
     const allocate_block = @import("vsr/grid.zig").allocate_block;
     const BlockPtr = @import("vsr/grid.zig").BlockPtr;
-    const BlockRingBuffer = RingBuffer(BlockPtr, .{ .array = 128 });
+    const BlockRingBuffer = RingBuffer(BlockPtr, .slice);
 
     const allocator = std.testing.allocator;
-
-    var stream = BlockRingBuffer.init();
+    const blocks: []BlockPtr = &.{};
+    var stream = BlockRingBuffer.init(blocks);
 
     const block_to_write = try allocate_block(allocator);
     defer allocator.free(block_to_write);

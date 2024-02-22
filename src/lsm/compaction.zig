@@ -346,7 +346,8 @@ pub fn CompactionType(
             input_values_processed: u64 = 0,
 
             /// When level_b == 0, it means level_a is the immutable table.
-            iterator_a: union(enum) { immutable: Tree.TableMemory.Iterator, disk: ValueBlocksIterator },
+            // FIXME
+            iterator_a: Tree.TableMemory.Iterator, //union(enum) { immutable: Tree.TableMemory.Iterator, disk: ValueBlocksIterator },
 
             /// level_b always comes from disk.
             iterator_b: ValueBlocksIterator,
@@ -1137,7 +1138,7 @@ pub fn CompactionType(
 
             assert(bar.table_builder.value_count < Table.layout.block_value_count_max);
 
-            var iterator_a = &bar.iterator_a.immutable;
+            var iterator_a = &bar.iterator_a;
             var iterator_b = &bar.iterator_b;
 
             // Loop through the CPU work until we have nothing left.

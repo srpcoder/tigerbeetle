@@ -88,12 +88,12 @@ pub fn ManifestLogType(comptime Storage: type) type {
         /// - blocks that are being flushed
         ///
         /// Entries are ordered from oldest to newest.
-        log_block_checksums: RingBuffer(u128, .slice),
-        log_block_addresses: RingBuffer(u64, .slice),
+        log_block_checksums: RingBuffer(u128, .dynamic),
+        log_block_addresses: RingBuffer(u64, .dynamic),
 
         /// The head block accumulates a full block, to be written at the next flush.
         /// The remaining blocks must accommodate all further appends.
-        blocks: RingBuffer(BlockPtr, .slice),
+        blocks: RingBuffer(BlockPtr, .dynamic),
 
         /// The number of blocks that have been appended to, filled up, and then closed.
         blocks_closed: u8 = 0,
@@ -159,11 +159,11 @@ pub fn ManifestLogType(comptime Storage: type) type {
             }
 
             var log_block_checksums =
-                try RingBuffer(u128, .slice).init(allocator, pace.log_blocks_max);
+                try RingBuffer(u128, .dynamic).init(allocator, pace.log_blocks_max);
             errdefer log_block_checksums.deinit(allocator);
 
             var log_block_addresses =
-                try RingBuffer(u64, .slice).init(allocator, pace.log_blocks_max);
+                try RingBuffer(u64, .dynamic).init(allocator, pace.log_blocks_max);
             errdefer log_block_addresses.deinit(allocator);
 
             // The upper-bound of manifest blocks we must buffer.
@@ -176,9 +176,9 @@ pub fn ManifestLogType(comptime Storage: type) type {
                 1 + pace.half_bar_compact_blocks_max + pace.half_bar_append_blocks_max;
             assert(half_bar_buffer_blocks_max >= 3);
 
-            // TODO RingBuffer for .slice should be extended to take care of alignment:
+            // TODO RingBuffer for .dynamic should be extended to take care of alignment:
             var blocks =
-                try RingBuffer(BlockPtr, .slice).init(allocator, half_bar_buffer_blocks_max);
+                try RingBuffer(BlockPtr, .dynamic).init(allocator, half_bar_buffer_blocks_max);
             errdefer blocks.deinit(allocator);
 
             for (blocks.buffer, 0..) |*block, i| {

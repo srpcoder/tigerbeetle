@@ -523,10 +523,10 @@ pub fn StateMachineType(
                     self.prefetch_lookup_transfers(mem.bytesAsSlice(u128, input));
                 },
                 .get_account_transfers => {
-                    self.prefetch_get_account_transfers(parse_filter_from_input(input));
+                    // self.prefetch_get_account_transfers(parse_filter_from_input(input));
                 },
                 .get_account_history => {
-                    self.prefetch_get_account_history(parse_filter_from_input(input));
+                    // self.prefetch_get_account_history(parse_filter_from_input(input));
                 },
             };
         }
