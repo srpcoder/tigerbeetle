@@ -216,8 +216,6 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
             assert(event_data.len % event_size == 0);
             assert(event_data.len <= constants.message_body_size_max);
 
-            // Register before reserving a message.
-            self.register();
             const message = self.get_message().build(.request);
             errdefer self.release(message);
 
@@ -362,26 +360,32 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
                 return;
             }
 
-            const inflight = if (self.registering) |message|
-                Request{
-                    .message = message,
-                    .user_data = 0,
-                    .callback = undefined,
+            if (self.inflight_message()) |message| {
+                if (reply.header.request < message.header.request) {
+                    log.debug("{}: on_reply: ignoring (request {} < {})", .{
+                        self.id,
+                        reply.header.request,
+                        message.header.request,
+                    });
+                    return;
                 }
-            else if (self.inflight) |inflight|
-                inflight
-            else {
+                assert(reply.header.request_checksum == message.header.checksum);
+            } else {
                 log.debug("{}: on_reply: ignoring (no inflight request)", .{self.id});
                 return;
+            }
+
+            // Consume the inflight Request.
+            const inflight = if (self.registering) |message| blk: {
+                self.registering = null;
+                break :blk Request{ .message = message, .user_data = 0, .callback = undefined };
+            } else blk: {
+                defer self.inflight = null;
+                break :blk self.inflight.?;
             };
 
-            if (reply.header.request < inflight.message.header.request) {
-                log.debug("{}: on_reply: ignoring (request {} < {})", .{
-                    self.id,
-                    reply.header.request,
-                    inflight.message.header.request,
-                });
-                return;
+            if (self.on_reply_callback) |on_reply_callback| {
+                on_reply_callback(self, inflight.message, reply);
             }
 
             assert(reply.header.request_checksum == inflight.message.header.checksum);
@@ -399,10 +403,6 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
                 reply.header.size,
                 reply.header.operation.tag_name(StateMachine),
             });
-
-            if (self.on_reply_callback) |on_reply_callback| {
-                on_reply_callback(self, inflight.message, reply);
-            }
 
             // The context of this reply becomes the parent of our next request:
             self.parent = reply.header.context;
@@ -424,29 +424,27 @@ pub fn Client(comptime StateMachine_: type, comptime MessageBus: type) type {
             self.release(inflight.message.base());
             assert(self.messages_available > 0);
 
+            assert(self.registering == null); // The client should be done registering.
+            maybe(self.inflight == null); // on_reply_callback could've called request/raw_request.
+
             if (inflight_vsr_operation == .register) {
                 assert(self.session == 0);
                 assert(reply.header.commit > 0);
                 self.session = reply.header.commit; // The commit number becomes the session number.
 
-                // Stop registering and try to start the original message from request/raw_request.
-                assert(self.registering != null);
-                self.registering = null;
+                // The register message is always queued first.
+                // Start any request/raw_request message that was waiting for register to complete.
                 if (self.inflight) |next_inflight| {
                     self.send_request_for_the_first_time(next_inflight.message);
                 }
-
-                return;
+            } else {
+                // Complete the consumed inflight request.
+                inflight.callback(
+                    inflight.user_data,
+                    inflight_vsr_operation.cast(StateMachine),
+                    reply.body(),
+                );
             }
-
-            // Finish processing the inflight request.
-            assert(self.registering == null);
-            self.inflight = null;
-            inflight.callback(
-                inflight.user_data,
-                inflight_vsr_operation.cast(StateMachine),
-                reply.body(),
-            );
         }
 
         fn on_ping_timeout(self: *Self) void {

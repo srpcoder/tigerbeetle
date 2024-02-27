@@ -471,17 +471,17 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
                 .size = @intCast(@sizeOf(vsr.Header) + request_body_size),
             };
 
+            // Handle request queueing here in the cluster.
             const was_empty = queue.empty();
             queue.push_assume_capacity(message);
-
             if (was_empty) {
-                const user_data: u128 = @bitCast([_]usize{ @intFromPtr(cluster), client_index });
+                const user_data: u128 = @bitCast([2]u64{ @intFromPtr(cluster), client_index });
                 client.raw_request(request_callback, user_data, message);
             }
         }
 
-        /// The `request_callback` is not used to process the result, only update client_queues.
-        /// Cluster uses `Client.on_reply_{context,callback}` instead because:
+        /// The `request_callback` is not used — Cluster uses `Client.on_reply_{context,callback}`
+        /// instead because:
         /// - Cluster needs access to the request
         /// - Cluster needs access to the reply message (not just the body)
         /// - Cluster needs to know about command=register messages
@@ -492,21 +492,21 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
             operation: StateMachine.Operation,
             result: []const u8,
         ) void {
+            _ = operation;
             _ = result;
 
-            const data: [2]usize = @bitCast(user_data);
-            const cluster: *Self = @ptrFromInt(data[0]);
-            const client_index = data[1];
+            const user_info: [2]u64 = @bitCast(user_data);
+            const cluster: *Self = @ptrFromInt(user_info[0]);
+            const client_index: usize = user_info[1];
 
             const client = &cluster.clients[client_index];
             const queue = &cluster.client_queues[client_index];
 
-            const message = queue.pop().?;
-            assert(message.header.operation.cast(StateMachine) == operation);
-
-            // Process the next message that was enqueued if any.
-            if (queue.head()) |next_message| {
-                client.raw_request(request_callback, user_data, next_message);
+            // Simulate client request queueing here after potential queue.pop() in client_on_reply.
+            if (queue.head()) |message| {
+                if (client.inflight_message() == null) {
+                    client.raw_request(request_callback, user_data, message);
+                }
             }
         }
 
@@ -516,6 +516,10 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
             reply_message: *Message.Reply,
         ) void {
             const cluster: *Self = @ptrCast(@alignCast(client.on_reply_context.?));
+            const client_index = for (cluster.clients, 0..) |*c, i| {
+                if (client == c) break i;
+            } else unreachable;
+
             assert(reply_message.header.invalid() == null);
             assert(reply_message.header.cluster == cluster.options.cluster_id);
             assert(reply_message.header.client == client.id);
@@ -523,9 +527,10 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
             assert(reply_message.header.command == .reply);
             assert(reply_message.header.operation == request_message.header.operation);
 
-            const client_index = for (cluster.clients, 0..) |*c, i| {
-                if (client == c) break i;
-            } else unreachable;
+            const queue = &cluster.client_queues[client_index];
+            if (queue.head() == request_message) { // It may be the client's register message.
+                _ = queue.pop();
+            }
 
             cluster.on_client_reply(cluster, client_index, request_message, reply_message);
         }
