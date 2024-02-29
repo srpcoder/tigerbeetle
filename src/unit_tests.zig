@@ -20,6 +20,7 @@ comptime {
 
     _ = @import("lsm/binary_search.zig");
     _ = @import("lsm/cache_map.zig");
+    _ = @import("lsm/compaction.zig");
     _ = @import("lsm/composite_key.zig");
     _ = @import("lsm/forest.zig");
     _ = @import("lsm/forest_table_iterator.zig");

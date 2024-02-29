@@ -236,6 +236,28 @@ pub fn RingBuffer(
         pub const Slice = struct {
             first: []T,
             second: []T,
+            head_index: usize = 0,
+
+            pub fn count(self: *const Slice) usize {
+                return self.first.len + self.second.len;
+            }
+
+            pub fn pop_ptr(self: *Slice) *T {
+                defer self.head_index += 1;
+                return self.head_ptr();
+            }
+
+            pub fn head_ptr(self: *Slice) *T {
+                defer assert(self.head_index <= self.count());
+
+                return if (self.head_index < self.first.len) &self.first[self.head_index] else &self.second[self.head_index];
+            }
+
+            pub fn get_ptr(self: *Slice, idx: usize) *T {
+                assert(idx < self.count());
+
+                return if (idx < self.first.len) &self.first[idx] else &self.second[idx];
+            }
         };
 
         /// Returns a Slice into the underlying buffer. This can be used for writing items,
@@ -515,73 +537,4 @@ test "RingBuffer: push_head" {
 
 test "RingBuffer: count_max=0" {
     std.testing.refAllDecls(RingBuffer(u32, .{ .array = 0 }));
-}
-
-// The masking and clever bits are stolen from std.RingBuffer.
-// Invariants:
-// Number of blocks must be even, minimum of 2.
-// Internally, ValueStream is implemented as a ring buffer. There are two pointers, a read
-// pointer and a write pointer.
-// When starting off, it looks something like this:
-//
-// |  ␣  ␣  ␣  ␣  ␣  ␣  ␣  ␣  ␣  ␣  |
-//   R̂Ŵ
-//
-// Pushing fills up and increments the write pointer:
-// |  b  b  b  b  ␣  ␣  ␣  ␣  ␣  ␣  |
-//   R̂            Ŵ
-//
-// Confirming reads increment the read pointer (just doing a read_slice() will get you the same
-// contents over again):
-// |  b  b  b  b  ␣  ␣  ␣  ␣  ␣  ␣  |
-//       R̂        Ŵ
-//
-// More data can be pushed, up to the current read pointer:
-// |  b  b  b  b  B  B  B  B  B  B  |
-//      ŴR̂
-//
-// Why is this useful? When doing intra-tree-level pipelining, we can only read in values assuming
-// they'll be used. We don't know how many actual values have been consumed until the merge step
-// runs, but we schedule our reads _before_ doing any merges.
-//
-// In fact, the filling stage of our pipeline looks as follows, in order:
-// 0: read()
-// 1: read(), merge()
-// 2: read(), write(), merge()
-//
-// While there is a barrier at the end, the synchronous part of the read() and write() steps (ie - _what_ to read and write) are always submitted
-// before merging. For this example, pretend table_a is immutable so we only have to worry about reads from one side.
-// 0: For the very first read(), this is not a problem; it starts from the beginning and reads in say 3 blocks.
-// 1: For the next read(), it will read in the next 3 blocks. The merge will now begin, perhaps it uses 2 blocks - it can only use up to the reads completed in the previous step.
-// 2: For the next read(), we know that we now read
-test "value stream: foo" {
-    const allocate_block = @import("vsr/grid.zig").allocate_block;
-    const BlockPtr = @import("vsr/grid.zig").BlockPtr;
-    const BlockRingBuffer = RingBuffer(BlockPtr, .slice);
-
-    const allocator = std.testing.allocator;
-    var blocks: [32]BlockPtr = undefined;
-    var stream = BlockRingBuffer.init(&blocks);
-
-    const block_to_write = try allocate_block(allocator);
-    defer allocator.free(block_to_write);
-    @memset(block_to_write, 1);
-
-    const ring_slice = stream.as_slice(stream.index, 32);
-    ring_slice.first[0] = block_to_write;
-    ring_slice.first[1] = block_to_write;
-    stream.count += 2;
-
-    std.log.warn("Ring buffer with {} available slots", .{stream.buffer.len - stream.count});
-
-    var block = stream.pop();
-    std.log.warn("Read: {any}", .{block});
-    block = stream.pop();
-    std.log.warn("Read: {any}", .{block});
-
-    std.log.warn("Ring buffer with {} available slots", .{stream.buffer.len - stream.count});
-    // stream.write_slice(&blocks_to_write);
-    // const blocks_read = stream.read_slice();
-    // std.log.warn("Read: {any}", .{blocks_read});
-    // assert(false);
 }

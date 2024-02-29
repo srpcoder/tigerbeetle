@@ -17,7 +17,7 @@ const NodePool = @import("node_pool.zig").NodePool(constants.lsm_manifest_node_s
 const ManifestLogType = @import("manifest_log.zig").ManifestLogType;
 const ScanBufferPool = @import("scan_buffer.zig").ScanBufferPool;
 const CompactionInterfaceType = @import("compaction.zig").CompactionInterfaceType;
-const CompactionBlocks = @import("compaction.zig").CompactionBlocks;
+const CompactionHelperType = @import("compaction.zig").CompactionHelperType;
 const BlipStage = @import("compaction.zig").BlipStage;
 const Exhausted = @import("compaction.zig").Exhausted;
 
@@ -154,6 +154,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
     // TODO: With all this trouble, why not just store the compaction memory here and move it out
     // of Tree entirely...
     const CompactionInterface = CompactionInterfaceType(Grid, _tree_infos);
+    const CompactionHelper = CompactionHelperType(Grid);
 
     return struct {
         const Forest = @This();
@@ -187,14 +188,9 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
             grid: *Grid,
 
-            /// Raw, linear buffer of blocks that will be split up.
-            compaction_blocks: []BlockPtr,
-            compaction_blocks_split: CompactionBlocks = undefined,
-
-            // TODO: If we want to be able to use our blocks freely, we need just as many reads as
-            // writes. We could do a union, just not sure if it's worth it yet.
-            compaction_reads: []Grid.FatRead,
-            compaction_writes: []Grid.FatWrite,
+            /// Raw, linear buffer of blocks + reads / writes that will be split up.
+            compaction_blocks: []CompactionHelper.CompactionBlock,
+            compaction_blocks_split: ?CompactionHelper.CompactionBlocks = null,
 
             compactions: stdx.BoundedArray(CompactionInterface, compaction_count) = .{},
 
@@ -216,33 +212,25 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             callback: ?Callback = null,
 
             pub fn init(allocator: mem.Allocator, grid: *Grid) !CompactionPipeline {
-                const compaction_blocks = try allocator.alloc(BlockPtr, 1024);
+                const compaction_blocks = try allocator.alloc(CompactionHelper.CompactionBlock, 1024);
                 errdefer allocator.free(compaction_blocks);
 
-                for (compaction_blocks, 0..) |*cache_block, i| {
-                    errdefer for (compaction_blocks[0..i]) |block| allocator.free(block);
-                    cache_block.* = try allocate_block(allocator);
+                for (compaction_blocks, 0..) |*compaction_block, i| {
+                    errdefer for (compaction_blocks[0..i]) |block| allocator.free(block.block);
+                    compaction_block.* = .{
+                        .block = try allocate_block(allocator),
+                    };
                 }
-                errdefer for (compaction_blocks) |block| allocator.free(block);
-
-                const compaction_reads = try allocator.alloc(Grid.FatRead, 1024);
-                errdefer allocator.free(compaction_reads);
-
-                const compaction_writes = try allocator.alloc(Grid.FatWrite, 1024);
-                errdefer allocator.free(compaction_writes);
+                errdefer for (compaction_blocks) |block| allocator.free(block.block);
 
                 return .{
                     .compaction_blocks = compaction_blocks,
-                    .compaction_reads = compaction_reads,
-                    .compaction_writes = compaction_writes,
                     .grid = grid,
                 };
             }
 
             pub fn deinit(self: *CompactionPipeline, allocator: mem.Allocator) void {
-                allocator.free(self.compaction_writes);
-                allocator.free(self.compaction_reads);
-                for (self.compaction_blocks) |block| allocator.free(block);
+                for (self.compaction_blocks) |block| allocator.free(block.block);
                 allocator.free(self.compaction_blocks);
             }
 
@@ -256,7 +244,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             /// |-----------------------------|-----------------------------|
             /// | Table A     | Table B       | Table A     | Table B       |
             /// -------------------------------------------------------------
-            fn divide_blocks(self: *CompactionPipeline) CompactionBlocks {
+            fn divide_blocks(self: *CompactionPipeline) CompactionHelper.CompactionBlocks {
                 const minimum_block_count: u64 = blk: {
                     var minimum_block_count: u64 = 0;
 
@@ -291,15 +279,13 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
                 const target_value_blocks = blocks[30..][0..10];
 
-                const source_value_blocks = .{
-                    source_value_level_a,
-                    source_value_level_b,
-                };
-
                 return .{
                     .source_index_blocks = source_index_blocks,
-                    .source_value_blocks = source_value_blocks,
-                    .target_value_blocks = target_value_blocks,
+                    .source_value_blocks = .{
+                        CompactionHelper.BlockRingBuffer.init(source_value_level_a),
+                        CompactionHelper.BlockRingBuffer.init(source_value_level_b),
+                    },
+                    .target_value_blocks = CompactionHelper.BlockRingBuffer.init(target_value_blocks),
                 };
             }
 
@@ -322,9 +308,9 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                         // A compaction is marked as live at the start of a bar.
                         self.active_bar.set(i);
 
-                        // FIXME: These blocks need to be disjoint. Any way we can assert that?
-                        const blocks = .{ self.compaction_blocks[900 + i .. 900 + i + 1], self.compaction_blocks[1000 + i .. 1000 + i + 1] };
-                        compaction.bar_setup_budget(constants.lsm_batch_multiple, blocks);
+                        // FIXME: These blocks need to be disjoint from all others. Any way we can assert that?
+                        const ring_buffer = CompactionHelper.BlockRingBuffer.init(self.compaction_blocks[900 + i .. 900 + i + 2]);
+                        compaction.bar_setup_budget(constants.lsm_batch_multiple, ring_buffer);
                     }
 
                     // Split up our internal block pool as needed for the compaction pipelines.
@@ -528,9 +514,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                     // FIXME: Assert beat_blocks_assign is only called once in compaction?
                     if (slot_idx == 0) {
                         self.slots[slot_idx].?.interface.beat_blocks_assign(
-                            self.compaction_blocks_split,
-                            self.compaction_reads,
-                            self.compaction_writes,
+                            self.compaction_blocks_split.?,
                         );
                     }
 
@@ -811,6 +795,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 forest.manifest_log_progress = .compacting;
                 forest.manifest_log.compact(compact_manifest_log_callback, op);
                 forest.compaction_progress = .trees_and_manifest;
+                std.log.info("waiting for trees and manifest...", .{});
             } else {
                 assert(forest.manifest_log_progress == .idle);
             }
@@ -823,11 +808,15 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             if (forest.compaction_progress == .trees_and_manifest)
                 assert(forest.manifest_log_progress != .idle);
 
+            std.log.info("inside compact_callback...", .{});
+
             forest.compaction_progress = if (forest.compaction_progress == .trees_and_manifest) .trees_or_manifest else .idle;
 
             if (forest.compaction_progress != .idle) {
                 return;
             }
+
+            std.log.info("inside compact_callback joined...", .{});
 
             forest.verify_table_extents();
 
@@ -878,6 +867,8 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
             const callback = progress.callback;
             forest.progress = null;
+
+            std.log.info("inside calling callback??...", .{});
             callback(forest);
         }
 
