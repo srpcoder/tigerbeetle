@@ -10,8 +10,7 @@ pub fn RingBuffer(
     comptime T: type,
     comptime buffer_type: union(enum) {
         array: usize, // capacity
-        slice, // A pre-allocated slice is passed in.
-        dynamic, // (Capacity is passed to init() at runtime).
+        slice, // (Capacity is passed to init() at runtime).
     },
 ) type {
     return struct {
@@ -20,12 +19,11 @@ pub fn RingBuffer(
         pub const count_max = switch (buffer_type) {
             .array => |count_max_| count_max_,
             .slice => {},
-            .dynamic => {},
         };
 
         buffer: switch (buffer_type) {
             .array => |count_max_| [count_max_]T,
-            .slice, .dynamic => []T,
+            .slice => []T,
         },
 
         /// The index of the slot with the first item, if any.
@@ -41,11 +39,6 @@ pub fn RingBuffer(
                 }
             },
             .slice => struct {
-                pub fn init(buffer: []T) Self {
-                    return .{ .buffer = buffer };
-                }
-            },
-            .dynamic => struct {
                 pub fn init(allocator: mem.Allocator, capacity: usize) !Self {
                     assert(capacity > 0);
 
@@ -230,52 +223,6 @@ pub fn RingBuffer(
             return result;
         }
 
-        /// A `Slice` represents a region of a ring buffer. The region is split into two
-        /// sections as the ring buffer data will not be contiguous if the desired
-        /// region wraps to the start of the backing slice.
-        pub const Slice = struct {
-            first: []T,
-            second: []T,
-            head_index: usize = 0,
-
-            pub fn count(self: *const Slice) usize {
-                return self.first.len + self.second.len;
-            }
-
-            pub fn pop_ptr(self: *Slice) *T {
-                defer self.head_index += 1;
-                return self.head_ptr();
-            }
-
-            pub fn head_ptr(self: *Slice) *T {
-                defer assert(self.head_index <= self.count());
-
-                return if (self.head_index < self.first.len) &self.first[self.head_index] else &self.second[self.head_index];
-            }
-
-            pub fn get_ptr(self: *Slice, idx: usize) *T {
-                assert(idx < self.count());
-
-                return if (idx < self.first.len) &self.first[idx] else &self.second[idx];
-            }
-        };
-
-        /// Returns a Slice into the underlying buffer. This can be used for writing items,
-        /// combined with incrementing count manually, so bound on the underlying buffer
-        /// rather than the number of items currently in the ring buffer.
-        pub fn as_slice(self: *Self, start: usize, len: usize) Slice {
-            assert(len <= self.buffer.len);
-            assert(start <= self.buffer.len);
-
-            const first = self.buffer[start..@min(self.buffer.len, start + len)];
-            const second = self.buffer[0 .. len - first.len];
-
-            return Slice{
-                .first = first,
-                .second = second,
-            };
-        }
-
         pub const Iterator = struct {
             ring: *const Self,
             count: usize = 0,
@@ -453,7 +400,7 @@ test "RingBuffer: low level interface" {
     var array_ring = ArrayRing.init();
     try test_low_level_interface(ArrayRing, &array_ring);
 
-    const PointerRing = RingBuffer(u32, .dynamic);
+    const PointerRing = RingBuffer(u32, .slice);
     var pointer_ring = try PointerRing.init(testing.allocator, 2);
     defer pointer_ring.deinit(testing.allocator);
     try test_low_level_interface(PointerRing, &pointer_ring);
