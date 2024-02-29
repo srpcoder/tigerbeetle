@@ -314,8 +314,15 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                         // A compaction is marked as live at the start of a bar.
                         self.active_bar.set(i);
 
+                        const blocks = self.compaction_blocks[900 + i .. 900 + i + 2];
+
+                        for (blocks) |*block| {
+                            block.next = null;
+                        }
+
                         // FIXME: These blocks need to be disjoint from all others. Any way we can assert that?
-                        const ring_buffer = CompactionHelper.BlockPool.init(self.compaction_blocks[900 + i .. 900 + i + 2]);
+                        const ring_buffer = CompactionHelper.BlockPool.init(blocks);
+
                         compaction.bar_setup_budget(constants.lsm_batch_multiple, ring_buffer);
                     }
                 }
@@ -758,20 +765,20 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
                         // FIXME: Big hack to limit to a single tree for debugging! This only
                         // compacts the Account object tree and discards the rest.
-                        if (tree_id != 2) {
-                            tree.table_immutable.mutability.immutable.flushed = true;
-                        } else {
-                            assert(tree.compactions.len == constants.lsm_levels);
+                        // if (tree_id != 2) {
+                        //     tree.table_immutable.mutability.immutable.flushed = true;
+                        // } else {
+                        assert(tree.compactions.len == constants.lsm_levels);
 
-                            var compaction = &tree.compactions[level_b];
+                        var compaction = &tree.compactions[level_b];
 
-                            // This will return how many compactions and stuff this level needs to do...
-                            if (compaction.bar_setup(tree, op)) |info| {
-                                // FIXME: Assert len?
-                                forest.compaction_pipeline.compactions.append_assume_capacity(CompactionInterface.init(info, compaction));
-                                log.info("Target Level: {}, Tree: {s}@{}: {}", .{ level_b, tree.config.name, op, info });
-                            }
+                        // This will return how many compactions and stuff this level needs to do...
+                        if (compaction.bar_setup(tree, op)) |info| {
+                            // FIXME: Assert len?
+                            forest.compaction_pipeline.compactions.append_assume_capacity(CompactionInterface.init(info, compaction));
+                            log.info("Target Level: {}, Tree: {s}@{}: {}", .{ level_b, tree.config.name, op, info });
                         }
+                        // }
                     }
                 }
                 log.info("===============================================================", .{});

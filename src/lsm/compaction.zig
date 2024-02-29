@@ -115,6 +115,7 @@ pub fn CompactionHelperType(comptime Grid: type) type {
             free: BlockFIFO,
             pending: BlockFIFO,
             ready: BlockFIFO,
+            count: usize,
 
             pub fn init(blocks: []CompactionBlock) BlockPool {
                 assert(blocks.len % 2 == 0);
@@ -132,10 +133,12 @@ pub fn CompactionHelperType(comptime Grid: type) type {
                     .free = free,
                     .pending = .{ .name = null },
                     .ready = .{ .name = null },
+                    .count = blocks.len,
                 };
             }
 
             pub fn free_to_pending(self: *BlockPool) ?*CompactionBlock {
+                std.log.info("free_to_pending", .{});
                 const value = self.free.pop() orelse return null;
                 self.pending.push(value);
 
@@ -143,6 +146,7 @@ pub fn CompactionHelperType(comptime Grid: type) type {
             }
 
             pub fn pending_to_ready(self: *BlockPool) ?*CompactionBlock {
+                std.log.info("pending_to_ready", .{});
                 const value = self.pending.pop() orelse return null;
                 self.ready.push(value);
 
@@ -150,6 +154,7 @@ pub fn CompactionHelperType(comptime Grid: type) type {
             }
 
             pub fn ready_to_free(self: *BlockPool) ?*CompactionBlock {
+                std.log.info("ready_to_free", .{});
                 const value = self.ready.pop() orelse return null;
                 self.free.push(value);
 
@@ -1193,6 +1198,9 @@ pub fn CompactionType(
             var source_a_remaining = source_a.remaining();
             var source_b_remaining = source_b.remaining_in_memory();
 
+            var index_blocks_used: usize = 0;
+            var value_blocks_used: usize = 0;
+
             // // Loop through the CPU work until we have nothing left.
             while (source_a_remaining > 0 or source_b_remaining > 0) {
                 // FIXME: We can store our key here (or even a full value) across blips, to assert we're starting
@@ -1213,6 +1221,7 @@ pub fn CompactionType(
                     log.info("blip_merge(): Setting target index block.", .{});
                     @memset(index_block, 0); // FIXME: We don't need to zero the whole block; just the part of the padding that's not covered by alignment.
                     bar.table_builder.set_index_block(index_block);
+                    index_blocks_used += 1;
                 }
 
                 // Set the value block if needed.
@@ -1221,6 +1230,7 @@ pub fn CompactionType(
                     log.info("blip_merge(): Setting target value block.", .{});
                     @memset(value_block, 0); // FIXME: We don't need to zero the whole block; just the part of the padding that's not covered by alignment.
                     bar.table_builder.set_data_block(value_block);
+                    value_blocks_used += 1;
                 }
 
                 if (source_a_remaining == 0) {
@@ -1265,7 +1275,10 @@ pub fn CompactionType(
                 // a full value block.
                 source_exhausted_bar = bar.source_values_processed == bar.compaction_tables_value_count;
                 source_exhausted_beat = beat.source_values_processed >= bar.per_beat_input_goal;
-
+                const pipeline_blocks_finished =
+                    value_blocks_used == @divExact(target_value_blocks.count, 2);
+                // = index_blocks_used == @divExact(target_index_blocks.count, 2) or
+                // FIXME: ACTUALLY - move these pipeline_blocks_finished checks into where we set the blocks above. Its fine if we break out there!
                 log.info("blip_merge(): merged {} so far, goal {}. (source_exhausted_bar: {}, source_exhausted_beat: {}) (bar.source_values_processed: {}, bar.compaction_tables_value_count: {})", .{
                     beat.source_values_processed,
                     bar.per_beat_input_goal,
@@ -1277,7 +1290,7 @@ pub fn CompactionType(
 
                 switch (compaction.check_and_finish_blocks(source_exhausted_bar, target_index_blocks, target_value_blocks)) {
                     .unfinished_value_block => continue,
-                    .finished_value_block => if (source_exhausted_beat) break,
+                    .finished_value_block => if (source_exhausted_beat or pipeline_blocks_finished) break,
                     .need_write => {
                         std.log.info("blip_merge(): buffers exhausted, breaking for write.", .{});
                         break;
@@ -1336,11 +1349,12 @@ pub fn CompactionType(
                     .tree_id = compaction.tree_config.id,
                 });
 
+                assert(target_value_blocks.pending.count == 1);
                 _ = target_value_blocks.pending_to_ready().?;
                 finished_value_block = true;
 
                 // FIXME: Ehhh technically we have to split our buffer!
-                if (target_value_blocks.pending.empty() or force_flush) {
+                if (target_value_blocks.free.empty() or force_flush) {
                     output_blocks_full = true;
                 }
             }
@@ -1358,9 +1372,10 @@ pub fn CompactionType(
                     .tree_id = compaction.tree_config.id,
                 });
 
+                assert(target_index_blocks.pending.count == 1);
                 _ = target_index_blocks.pending_to_ready().?;
 
-                if (target_index_blocks.pending.empty() or force_flush) {
+                if (target_index_blocks.free.empty() or force_flush) {
                     output_blocks_full = true;
                 }
 
@@ -1404,6 +1419,7 @@ pub fn CompactionType(
             }
 
             // Write any complete value blocks.
+            std.log.info("We have {} blocks ready to write", .{beat.blocks.?.target_value_blocks.ready.count});
             var maybe_target_value_block = beat.blocks.?.target_value_blocks.ready.peek();
             while (maybe_target_value_block) |target_value_block| : (maybe_target_value_block = target_value_block.next) {
                 log.info("blip_write(): Issuing a value write for 0x{x}", .{@intFromPtr(target_value_block.block)});
@@ -1443,6 +1459,14 @@ pub fn CompactionType(
             // log.info("blip_write_callback for split {}", .{write_split});
             // Join on all outstanding writes before continuing.
             if (write.pending_writes != 0) return;
+
+            while (beat.blocks.?.target_value_blocks.ready_to_free() != null) {
+                std.log.info("moved a ready value block to free...", .{});
+            }
+
+            while (compaction.bar.?.target_index_blocks.?.ready_to_free() != null) {
+                std.log.info("moved a ready index block to free...", .{});
+            }
 
             // Call the next tick handler directly. This callback is invoked async, so it's safe
             // from stack overflows.
