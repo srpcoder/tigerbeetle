@@ -42,6 +42,7 @@ const tracer = @import("../tracer.zig");
 const constants = @import("../constants.zig");
 
 const stdx = @import("../stdx.zig");
+const FIFO = @import("../fifo.zig").FIFO;
 const GridType = @import("../vsr/grid.zig").GridType;
 const BlockPtr = @import("../vsr/grid.zig").BlockPtr;
 const BlockPtrConst = @import("../vsr/grid.zig").BlockPtrConst;
@@ -82,99 +83,16 @@ pub const BlipStage = enum { read, merge, write };
 // forest.
 pub fn CompactionHelperType(comptime Grid: type) type {
     return struct {
-        /// Wrap a RingBuffer, and provide an interface around it given that the underlying slice
-        /// is managed (ie, BlockPtr) memory.
-        pub const BlockRingBuffer = struct {
-            pub const Inner = @import("../ring_buffer.zig").RingBuffer(CompactionBlock, .slice);
-            pub const Slice = Inner.Slice;
-
-            inner: Inner,
-            read_outstanding: ?struct { start: usize, len: usize } = null,
-            write_outstanding: ?struct { start: usize, len: usize } = null,
-
-            pub fn init(blocks: []CompactionBlock) BlockRingBuffer {
-                assert(blocks.len % 2 == 0);
-
-                return .{
-                    .inner = Inner.init(blocks),
-                };
-            }
-
-            pub fn format(value: BlockRingBuffer, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
-                return writer.print("BlockRingBuffer: inner.index: {}, inner.count: {}, write_outstanding: {?}", .{ value.inner.index, value.inner.count, value.write_outstanding });
-            }
-
-            /// Reads a slice from the ring buffer.
-            /// Must be consumed by calling .read().
-            fn readable_slice(self: *BlockRingBuffer) Slice {
-                assert(self.read_outstanding == null);
-                stdx.maybe(self.write_outstanding == null);
-
-                const start = self.inner.index;
-                const len = @min(self.inner.count, @divExact(self.inner.buffer.len, 2));
-
-                log.info("BlockRingBuffer.readable_slice() inner.buffer.len: {}, inner.index: {}, inner.count: {} slicing (start = {}, len = {})", .{ self.inner.buffer.len, self.inner.index, self.inner.count, start, len });
-
-                if (self.write_outstanding) |write_outstanding| {
-                    // FIXME: Assert no overlap between write_outstanding and {start, len}.
-                    _ = write_outstanding;
-                }
-
-                self.read_outstanding = .{ .start = start, .len = len };
-                return self.inner.as_slice(start, len);
-            }
-
-            fn read(self: *BlockRingBuffer, len: usize) void {
-                assert(self.read_outstanding != null);
-                assert(len <= self.read_outstanding.?.len);
-                assert(len <= @divExact(self.inner.buffer.len, 2));
-
-                self.read_outstanding = null;
-
-                // FIXME: Wait what is this lolgic?
-                self.inner.index = (self.inner.index + len) % self.inner.buffer.len;
-                self.inner.count -= len;
-            }
-
-            /// Returns a slice into the ring buffer that can be written to. Only one
-            /// writable_slice can be active at a time.
-            /// Must be persisted by calling write().
-            fn writable_slice(self: *BlockRingBuffer) Slice {
-                assert(self.write_outstanding == null);
-                stdx.maybe(self.read_outstanding == null);
-
-                const start = self.inner.index + self.inner.count;
-                const len = @min(self.inner.buffer.len - self.inner.count, @divExact(self.inner.buffer.len, 2));
-
-                log.info("BlockRingBuffer.writable_slice() inner.buffer.len: {}, inner.index: {}, inner.count: {} slicing (start = {}, len = {})", .{ self.inner.buffer.len, self.inner.index, self.inner.count, start, len });
-
-                self.write_outstanding = .{ .start = start, .len = len };
-                return self.inner.as_slice(start, len);
-            }
-
-            fn write(self: *BlockRingBuffer, len: usize) void {
-                assert(self.write_outstanding != null);
-                assert(len <= self.write_outstanding.?.len);
-                assert(len <= @divExact(self.inner.buffer.len, 2));
-
-                log.info("BlockRingBuffer.write({})", .{len});
-                self.write_outstanding = null;
-
-                self.inner.count += len;
-                assert(self.inner.count <= self.inner.buffer.len);
-            }
-        };
-
         pub const CompactionBlocks = struct {
             /// Index blocks are global, and shared between blips.
             /// FIXME: This complicates things somewhat.
             source_index_blocks: []CompactionBlock,
 
-            /// For each source level, we have a ring buffer of CompactionBlocks.
-            source_value_blocks: [2]BlockRingBuffer,
+            /// For each source level, we have a buffer of CompactionBlocks.
+            source_value_blocks: [2]BlockPool,
 
-            /// We only have one ring buffer of output CompactionBlocks.
-            target_value_blocks: BlockRingBuffer,
+            /// We only have one buffer of output CompactionBlocks.
+            target_value_blocks: BlockPool,
         };
 
         pub const CompactionBlock = struct {
@@ -187,6 +105,56 @@ pub fn CompactionHelperType(comptime Grid: type) type {
             // FIXME: This can very much be a union in future!
             read: Grid.Read = undefined,
             write: Grid.Write = undefined,
+
+            next: ?*CompactionBlock = null,
+        };
+
+        pub const BlockPool = struct {
+            const BlockFIFO = FIFO(CompactionBlock);
+
+            free: BlockFIFO,
+            pending: BlockFIFO,
+            ready: BlockFIFO,
+
+            pub fn init(blocks: []CompactionBlock) BlockPool {
+                assert(blocks.len % 2 == 0);
+                std.log.info("Fresh block pool in the house...", .{});
+
+                var free: BlockFIFO = .{
+                    .name = null,
+                };
+
+                for (blocks) |*block| {
+                    free.push(block);
+                }
+
+                return .{
+                    .free = free,
+                    .pending = .{ .name = null },
+                    .ready = .{ .name = null },
+                };
+            }
+
+            pub fn free_to_pending(self: *BlockPool) ?*CompactionBlock {
+                const value = self.free.pop() orelse return null;
+                self.pending.push(value);
+
+                return value;
+            }
+
+            pub fn pending_to_ready(self: *BlockPool) ?*CompactionBlock {
+                const value = self.pending.pop() orelse return null;
+                self.ready.push(value);
+
+                return value;
+            }
+
+            pub fn ready_to_free(self: *BlockPool) ?*CompactionBlock {
+                const value = self.ready.pop() orelse return null;
+                self.free.push(value);
+
+                return value;
+            }
         };
     };
 }
@@ -254,7 +222,7 @@ pub fn CompactionInterfaceType(comptime Grid: type, comptime tree_infos: anytype
             };
         }
 
-        pub fn bar_setup_budget(self: *const Self, beats_max: u64, target_index_blocks: Helpers.BlockRingBuffer) void {
+        pub fn bar_setup_budget(self: *const Self, beats_max: u64, target_index_blocks: Helpers.BlockPool) void {
             return switch (self.dispatcher) {
                 inline else => |compaction_impl| compaction_impl.bar_setup_budget(beats_max, target_index_blocks),
             };
@@ -327,93 +295,87 @@ pub fn CompactionType(
         };
 
         // THis name tho :(
-        /// The BlockRingBufferValueIterator has a lifetime over the entire bar, but its backing
-        /// buffer (the BlockRingBuffer) only has a lifetime of a beat.
-        const BlockRingBufferValueIterator = struct {
+        /// The BlockPoolValueIterator has a lifetime over the entire bar, but its backing
+        /// buffer (the BlockPool) only has a lifetime of a beat. The BlockPool is refilled,
+        /// out of band, such that the head at the active element is the block we need to start
+        /// with.
+        const BlockPoolValueIterator = struct {
             const Position = struct {
                 value_block: usize = 0,
                 value_block_index: usize = 0,
             };
 
-            ring_buffer: ?*Helpers.BlockRingBuffer = null,
-            readable_slice: ?*Helpers.BlockRingBuffer.Slice = null,
-            blocks_fully_consumed: usize = 0,
+            buffer: ?*Helpers.BlockPool = null,
             position: Position = .{},
+
+            // Used to assert we yield values in correct order. Perhaps gate on verify.
             last_value: ?Value = null,
 
-            pub fn init() BlockRingBufferValueIterator {
+            pub fn init() BlockPoolValueIterator {
                 return .{};
             }
 
             /// Returns the number of values that are in memory (_not_ the total number of values
             /// remaining).
-            pub fn remaining_in_memory(self: *BlockRingBufferValueIterator) usize {
-                assert(self.ring_buffer != null);
-                assert(self.readable_slice != null);
+            pub fn remaining_in_memory(self: *BlockPoolValueIterator) usize {
+                assert(self.buffer != null);
 
-                if (self.readable_slice.?.count() == 0 or self.readable_slice.?.head_index == self.readable_slice.?.count())
-                    return 0;
+                if (self.buffer.?.ready.empty()) return 0;
 
-                return result: {
-                    const head_remaining = Table.data_block_values_used(self.readable_slice.?.head_ptr().block)[self.position.value_block_index..].len;
-                    var rest_remaining: usize = 0;
-                    for (self.readable_slice.?.head_index + 1..self.readable_slice.?.count()) |i| {
-                        rest_remaining += Table.data_block_values_used(self.readable_slice.?.get_ptr(i).block).len;
+                std.log.info("ready blocks: {}; current vbi: {}", .{ self.buffer.?.ready.count, self.position.value_block_index });
 
-                        // FIXME: If not last, assert full.
-                    }
-                    break :result head_remaining + rest_remaining;
-                };
+                var len: usize = 0;
+                var maybe_head = self.buffer.?.ready.peek();
+                while (maybe_head) |head| {
+                    len += Table.data_block_values_used(head.block).len;
+                    maybe_head = head.next;
+                }
+
+                // We need to subtract off our current index to account for the fact that the first
+                // block might be partially used.
+                return len - self.position.value_block_index;
             }
 
             // FIXME: Ignoring performance for now, lets do it naively.
-            pub fn next(self: *BlockRingBufferValueIterator) ?Value {
-                assert(self.ring_buffer != null);
-                assert(self.readable_slice != null);
+            pub fn next(self: *BlockPoolValueIterator) ?Value {
+                assert(self.buffer != null);
 
-                std.log.info("next(): head_index: {}, count: {}, value_block_index: {}", .{ self.readable_slice.?.head_index, self.readable_slice.?.count(), self.position.value_block_index });
+                var head = self.buffer.?.ready.peek().?;
 
-                const current_values = Table.data_block_values_used(self.readable_slice.?.head_ptr().block);
+                const current_values = Table.data_block_values_used(head.block);
                 const value = current_values[self.position.value_block_index];
 
                 if (self.position.value_block_index + 1 == current_values.len) {
-                    self.blocks_fully_consumed += 1;
+                    // This block is done, move it back to our free list.
+                    const old = self.buffer.?.ready_to_free().?;
+                    log.info("next(): done with 0x{x} - moved to free", .{@intFromPtr(old.block)});
 
                     self.position.value_block_index = 0;
                     self.position.value_block += 1;
-                    self.readable_slice.?.head_index += 1;
-                    if (self.readable_slice.?.head_index == self.readable_slice.?.count()) {
-                        return null;
-                    }
+
+                    if (self.buffer.?.ready.empty()) return null;
                 } else {
                     self.position.value_block_index += 1;
                 }
 
+                // std.log.info("kfv: {}", .{key_from_value(&value)});
                 assert(self.last_value == null or key_from_value(&self.last_value.?) < key_from_value(&value));
 
                 self.last_value = value;
                 return value;
             }
 
-            pub fn ring_buffer_set(self: *BlockRingBufferValueIterator, ring_buffer: *Helpers.BlockRingBuffer, readable_slice: *Helpers.BlockRingBuffer.Slice) void {
-                std.log.info("RB SET", .{});
-                assert(self.ring_buffer == null);
-                assert(self.readable_slice == null);
+            pub fn buffer_set(self: *BlockPoolValueIterator, buffer: *Helpers.BlockPool) void {
+                std.log.info("B SET", .{});
+                assert(self.buffer == null);
 
-                self.ring_buffer = ring_buffer;
-                self.readable_slice = readable_slice;
+                self.buffer = buffer;
             }
 
-            pub fn ring_buffer_clear(self: *BlockRingBufferValueIterator) void {
-                std.log.info("RB clear - fully consumed {}", .{self.blocks_fully_consumed});
-                assert(self.ring_buffer != null);
-                assert(self.readable_slice != null);
-
-                self.ring_buffer.?.read(self.blocks_fully_consumed);
-
-                self.blocks_fully_consumed = 0;
-                self.ring_buffer = null;
-                self.readable_slice = null;
+            pub fn buffer_clear(self: *BlockPoolValueIterator) void {
+                std.log.info("B clear", .{});
+                assert(self.buffer != null);
+                self.buffer = null;
             }
         };
 
@@ -459,11 +421,11 @@ pub fn CompactionType(
             source_a: Tree.TableMemory.Iterator, //union(enum) { immutable: Tree.TableMemory.Iterator, disk: ValueBlocksIterator },
 
             /// level_b always comes from disk, and always starts a bar at (0, 0, 0).
-            source_b: BlockRingBufferValueIterator = .{},
+            source_b: BlockPoolValueIterator = .{},
 
             /// At least 2 output index blocks needs to span beat boundaries, otherwise it wouldn't be
             /// possible to pace at a more granular level than tables.
-            target_index_blocks: ?Helpers.BlockRingBuffer,
+            target_index_blocks: ?Helpers.BlockPool,
 
             /// Manifest log appends are queued up until `finish()` is explicitly called to ensure
             /// they are applied deterministically relative to other concurrent compactions.
@@ -809,7 +771,7 @@ pub fn CompactionType(
         /// Output index blocks are special, and are allocated at a bar level unlike all the other blocks
         /// which are done at a beat level. This is because while we can ensure we fill a value block, index
         /// blocks are too infrequent (one per table) to divide compaction by.
-        pub fn bar_setup_budget(compaction: *Compaction, beats_max: u64, target_index_blocks: Helpers.BlockRingBuffer) void {
+        pub fn bar_setup_budget(compaction: *Compaction, beats_max: u64, target_index_blocks: Helpers.BlockPool) void {
             assert(beats_max <= constants.lsm_batch_multiple);
             assert(compaction.bar != null);
             assert(compaction.beat == null);
@@ -1071,7 +1033,8 @@ pub fn CompactionType(
             // Read data for our tables in range b, which will always come from disk.
             const table_b_count = bar.range_b.tables.count();
 
-            var source_b_value_blocks = beat.blocks.?.source_value_blocks[1].writable_slice();
+            var source_b_value_blocks = &beat.blocks.?.source_value_blocks[1];
+            _ = source_b_value_blocks;
             var previous_schema: ?schema.TableIndex = null;
             var current_table_b_index_block_index: usize = 0; // FIXME: Hardcoded to 0 for now.
 
@@ -1084,8 +1047,6 @@ pub fn CompactionType(
                 previous_schema = index_schema;
 
                 const value_blocks_used = index_schema.data_blocks_used(index_block);
-                _ = value_blocks_used;
-
                 const value_block_addresses = index_schema.data_addresses_used(index_block);
                 const value_block_checksums = index_schema.data_checksums_used(index_block);
 
@@ -1093,14 +1054,16 @@ pub fn CompactionType(
                 // assert(bar.current_table_b_value_block_index < value_blocks_used);
                 // Try read in as many value blocks as this index block has...
                 var i: usize = bar.source_b.position.value_block;
-                while (i < source_b_value_blocks.count() and source_b_value_blocks.head_index < source_b_value_blocks.count()) {
-                    const compaction_block = source_b_value_blocks.pop_ptr();
+                var maybe_source_value_block = beat.blocks.?.source_value_blocks[1].free_to_pending();
 
-                    compaction_block.target = compaction;
-                    log.info("blip_read(): Issuing a value read for 0x{x}", .{@intFromPtr(compaction_block.block)});
+                while (i < value_blocks_used and maybe_source_value_block != null) {
+                    const source_value_block = maybe_source_value_block.?;
+
+                    source_value_block.target = compaction;
+                    log.info("blip_read(): Issuing a value read for 0x{x}", .{@intFromPtr(source_value_block.block)});
                     compaction.grid.read_block(
                         .{ .from_local_or_global_storage = blip_read_data_callback },
-                        &compaction_block.read,
+                        &source_value_block.read,
                         value_block_addresses[i],
                         value_block_checksums[i].value,
                         .{ .cache_read = true, .cache_write = true },
@@ -1108,6 +1071,9 @@ pub fn CompactionType(
 
                     read.pending_reads_data += 1;
                     i += 1;
+                    if (i < value_blocks_used) {
+                        maybe_source_value_block = beat.blocks.?.source_value_blocks[1].free_to_pending();
+                    }
                     // bar.current_table_b_value_block_index += 1;
 
                     // But, once our read buffer is full, break out of the outer loop.
@@ -1122,7 +1088,6 @@ pub fn CompactionType(
                 assert(table_b_count == 0);
             }
 
-            beat.blocks.?.source_value_blocks[1].write(source_b_value_blocks.head_index);
             log.info("blip_read(): Scheduled {} data reads.", .{read.pending_reads_data});
 
             // Either we have pending data reads, in which case blip_read_next_tick gets called by
@@ -1159,6 +1124,11 @@ pub fn CompactionType(
 
             // Join on all outstanding reads before continuing.
             if (read.pending_reads_data != 0) return;
+
+            // FIXME: HArdcoded to move to b
+            while (beat.blocks.?.source_value_blocks[1].pending_to_ready() != null) {
+                std.log.info("moved a pending block to ready...", .{});
+            }
 
             // Call the next tick handler directly. This callback is invoked async, so it's safe
             // from stack overflows.
@@ -1212,12 +1182,13 @@ pub fn CompactionType(
             const blocks = &beat.blocks.?;
             const source_blocks_a = &blocks.source_value_blocks[0];
             _ = source_blocks_a;
-            var source_blocks_b = blocks.source_value_blocks[1].readable_slice();
-            var target_value_blocks = blocks.target_value_blocks.writable_slice();
-            var target_index_blocks = bar.target_index_blocks.?.writable_slice();
 
-            bar.source_b.ring_buffer_set(&blocks.source_value_blocks[1], &source_blocks_b);
-            defer bar.source_b.ring_buffer_clear();
+            var source_blocks_b = &blocks.source_value_blocks[1];
+            var target_value_blocks = &blocks.target_value_blocks;
+            var target_index_blocks = &bar.target_index_blocks.?;
+
+            bar.source_b.buffer_set(source_blocks_b);
+            defer bar.source_b.buffer_clear();
 
             var source_a_remaining = source_a.remaining();
             var source_b_remaining = source_b.remaining_in_memory();
@@ -1238,7 +1209,7 @@ pub fn CompactionType(
 
                 // Set the index block if needed.
                 if (bar.table_builder.state == .no_blocks) {
-                    const index_block = target_index_blocks.head_ptr().block;
+                    const index_block = target_index_blocks.free_to_pending().?.block;
                     log.info("blip_merge(): Setting target index block.", .{});
                     @memset(index_block, 0); // FIXME: We don't need to zero the whole block; just the part of the padding that's not covered by alignment.
                     bar.table_builder.set_index_block(index_block);
@@ -1246,7 +1217,7 @@ pub fn CompactionType(
 
                 // Set the value block if needed.
                 if (bar.table_builder.state == .index_block) {
-                    const value_block = target_value_blocks.head_ptr().block;
+                    const value_block = target_value_blocks.free_to_pending().?.block;
                     log.info("blip_merge(): Setting target value block.", .{});
                     @memset(value_block, 0); // FIXME: We don't need to zero the whole block; just the part of the padding that's not covered by alignment.
                     bar.table_builder.set_data_block(value_block);
@@ -1304,7 +1275,7 @@ pub fn CompactionType(
                     bar.compaction_tables_value_count,
                 });
 
-                switch (compaction.check_and_finish_blocks(source_exhausted_bar, &target_index_blocks, &target_value_blocks)) {
+                switch (compaction.check_and_finish_blocks(source_exhausted_bar, target_index_blocks, target_value_blocks)) {
                     .unfinished_value_block => continue,
                     .finished_value_block => if (source_exhausted_beat) break,
                     .need_write => {
@@ -1315,11 +1286,11 @@ pub fn CompactionType(
             }
 
             // FIXME: Move these into the slice, so the slice has a .finish()?
-            std.log.info("blip_merge(): calling target_index_blocks.write() with {}", .{target_index_blocks.head_index});
-            bar.target_index_blocks.?.write(target_index_blocks.head_index);
+            // std.log.info("blip_merge(): calling target_index_blocks.write() with {}", .{target_index_blocks.head_index});
+            // bar.target_index_blocks.?.write(target_index_blocks.head_index);
 
-            std.log.info("blip_merge(): calling target_value_blocks.write() with {}", .{target_value_blocks.head_index});
-            blocks.target_value_blocks.write(target_value_blocks.head_index);
+            // std.log.info("blip_merge(): calling target_value_blocks.write() with {}", .{target_value_blocks.head_index});
+            // blocks.target_value_blocks.write(target_value_blocks.head_index);
 
             // // FIXME: Check at least one output value.
             // // assert(filled <= target.len);
@@ -1334,7 +1305,7 @@ pub fn CompactionType(
             });
         }
 
-        fn check_and_finish_blocks(compaction: *Compaction, force_flush: bool, target_index_blocks: *Helpers.BlockRingBuffer.Slice, target_value_blocks: *Helpers.BlockRingBuffer.Slice) enum {
+        fn check_and_finish_blocks(compaction: *Compaction, force_flush: bool, target_index_blocks: *Helpers.BlockPool, target_value_blocks: *Helpers.BlockPool) enum {
             unfinished_value_block,
             finished_value_block,
             need_write, // FIXME: Should be a noun
@@ -1365,9 +1336,11 @@ pub fn CompactionType(
                     .tree_id = compaction.tree_config.id,
                 });
 
+                _ = target_value_blocks.pending_to_ready().?;
                 finished_value_block = true;
-                target_value_blocks.head_index += 1;
-                if (target_value_blocks.head_index == target_value_blocks.count() or force_flush) {
+
+                // FIXME: Ehhh technically we have to split our buffer!
+                if (target_value_blocks.pending.empty() or force_flush) {
                     output_blocks_full = true;
                 }
             }
@@ -1385,8 +1358,9 @@ pub fn CompactionType(
                     .tree_id = compaction.tree_config.id,
                 });
 
-                target_index_blocks.head_index += 1;
-                if (target_index_blocks.head_index == target_index_blocks.count() or force_flush) {
+                _ = target_index_blocks.pending_to_ready().?;
+
+                if (target_index_blocks.pending.empty() or force_flush) {
                     output_blocks_full = true;
                 }
 
@@ -1420,30 +1394,24 @@ pub fn CompactionType(
             assert(write.pending_writes == 0);
 
             // Write any complete index blocks.
-            var target_index_blocks = bar.target_index_blocks.?.readable_slice();
+            var maybe_target_index_block = bar.target_index_blocks.?.ready.peek();
+            while (maybe_target_index_block) |target_index_block| : (maybe_target_index_block = target_index_block.next) {
+                log.info("blip_write(): Issuing an index write for 0x{x}", .{@intFromPtr(target_index_block.block)});
 
-            while (target_index_blocks.head_index < target_index_blocks.count()) {
-                const compaction_block = target_index_blocks.pop_ptr();
-                log.info("blip_write(): Issuing an index write for 0x{x}", .{@intFromPtr(compaction_block.block)});
-
-                compaction_block.target = compaction;
-                compaction.grid.create_block(blip_write_callback, &compaction_block.write, &compaction_block.block);
+                target_index_block.target = compaction;
+                compaction.grid.create_block(blip_write_callback, &target_index_block.write, &target_index_block.block);
                 write.pending_writes += 1;
             }
-            bar.target_index_blocks.?.read(target_index_blocks.count());
 
             // Write any complete value blocks.
-            var target_value_blocks = beat.blocks.?.target_value_blocks.readable_slice();
+            var maybe_target_value_block = beat.blocks.?.target_value_blocks.ready.peek();
+            while (maybe_target_value_block) |target_value_block| : (maybe_target_value_block = target_value_block.next) {
+                log.info("blip_write(): Issuing a value write for 0x{x}", .{@intFromPtr(target_value_block.block)});
 
-            while (target_value_blocks.head_index < target_value_blocks.count()) {
-                const compaction_block = target_value_blocks.pop_ptr();
-                log.info("blip_write(): Issuing a value write for 0x{x}", .{@intFromPtr(compaction_block.block)});
-
-                compaction_block.target = compaction;
-                compaction.grid.create_block(blip_write_callback, &compaction_block.write, &compaction_block.block);
+                target_value_block.target = compaction;
+                compaction.grid.create_block(blip_write_callback, &target_value_block.write, &target_value_block.block);
                 write.pending_writes += 1;
             }
-            beat.blocks.?.target_value_blocks.read(target_value_blocks.count());
 
             const d = write.timer.read();
             log.info("blip_write(): Took {} to create {} blocks", .{ std.fmt.fmtDuration(d), write.pending_writes });
@@ -1867,7 +1835,7 @@ pub fn compaction_op_min(op: u64) u64 {
 // test "value stream: foo" {
 //     const allocator = std.testing.allocator;
 //     var blocks: [32]BlockPtr = undefined;
-//     var stream = BlockRingBuffer.init(&blocks);
+//     var stream = BlockPool.init(&blocks);
 
 //     const block_to_write = try allocate_block(allocator);
 //     defer allocator.free(block_to_write);

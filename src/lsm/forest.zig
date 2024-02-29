@@ -190,7 +190,6 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
             /// Raw, linear buffer of blocks + reads / writes that will be split up.
             compaction_blocks: []CompactionHelper.CompactionBlock,
-            compaction_blocks_split: ?CompactionHelper.CompactionBlocks = null,
 
             compactions: stdx.BoundedArray(CompactionInterface, compaction_count) = .{},
 
@@ -271,6 +270,9 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 const blocks = self.compaction_blocks;
 
                 assert(blocks.len >= minimum_block_count);
+                for (blocks) |*block| {
+                    block.next = null;
+                }
 
                 const source_index_blocks = blocks[0..10];
 
@@ -282,10 +284,10 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 return .{
                     .source_index_blocks = source_index_blocks,
                     .source_value_blocks = .{
-                        CompactionHelper.BlockRingBuffer.init(source_value_level_a),
-                        CompactionHelper.BlockRingBuffer.init(source_value_level_b),
+                        CompactionHelper.BlockPool.init(source_value_level_a),
+                        CompactionHelper.BlockPool.init(source_value_level_b),
                     },
-                    .target_value_blocks = CompactionHelper.BlockRingBuffer.init(target_value_blocks),
+                    .target_value_blocks = CompactionHelper.BlockPool.init(target_value_blocks),
                 };
             }
 
@@ -301,6 +303,10 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 self.slot_filled_count = 0;
                 self.slot_running_count = 0;
 
+                if (op == 70) {
+                    // assert(false);
+                }
+
                 if (first_beat) {
                     self.active_bar = CompactionBitset.initEmpty();
 
@@ -309,12 +315,9 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                         self.active_bar.set(i);
 
                         // FIXME: These blocks need to be disjoint from all others. Any way we can assert that?
-                        const ring_buffer = CompactionHelper.BlockRingBuffer.init(self.compaction_blocks[900 + i .. 900 + i + 2]);
+                        const ring_buffer = CompactionHelper.BlockPool.init(self.compaction_blocks[900 + i .. 900 + i + 2]);
                         compaction.bar_setup_budget(constants.lsm_batch_multiple, ring_buffer);
                     }
-
-                    // Split up our internal block pool as needed for the compaction pipelines.
-                    self.compaction_blocks_split = self.divide_blocks();
                 }
 
                 // At the start of a beat, the active compactions are those that are still active
@@ -514,7 +517,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                     // FIXME: Assert beat_blocks_assign is only called once in compaction?
                     if (slot_idx == 0) {
                         self.slots[slot_idx].?.interface.beat_blocks_assign(
-                            self.compaction_blocks_split.?,
+                            self.divide_blocks(),
                         );
                     }
 
