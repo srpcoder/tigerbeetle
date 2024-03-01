@@ -480,8 +480,8 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
             }
         }
 
-        /// The `request_callback` is not used — Cluster uses `Client.on_reply_{context,callback}`
-        /// instead because:
+        /// The `request_callback` is not used for processing, only requeuing.
+        /// Cluster uses `Client.on_reply_{context,callback}` instead because:
         /// - Cluster needs access to the request
         /// - Cluster needs access to the reply message (not just the body)
         /// - Cluster needs to know about command=register messages
@@ -527,8 +527,10 @@ pub fn ClusterType(comptime StateMachineType: anytype) type {
             assert(reply_message.header.command == .reply);
             assert(reply_message.header.operation == request_message.header.operation);
 
+            // Check before popping the message from the queue.
+            // It may be the client's register message which is not pushed to the queue.
             const queue = &cluster.client_queues[client_index];
-            if (queue.head() == request_message) { // It may be the client's register message.
+            if (queue.head() == request_message) {
                 _ = queue.pop();
             }
 

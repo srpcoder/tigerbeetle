@@ -753,7 +753,7 @@ pub const Simulator = struct {
         );
         // Since we already checked the client's inflight for free space, `client.request()`
         // should always queue the request.
-        assert(request_message == queue.head().?.base());
+        assert(request_message == queue.tail().?.base());
         assert(request_message.header.size == @sizeOf(vsr.Header) + request_metadata.size);
         assert(request_message.header.into(.request).?.operation.cast(StateMachine) ==
             request_metadata.operation);
