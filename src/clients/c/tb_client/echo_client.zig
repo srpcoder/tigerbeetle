@@ -83,7 +83,15 @@ pub fn EchoClient(comptime StateMachine_: type, comptime MessageBus: type) type 
             };
 
             stdx.copy_disjoint(.exact, u8, message.body(), event_data);
+            self.raw_request(callback, user_data, message);
+        }
 
+        pub fn raw_request(
+            self: *Self,
+            callback: Request.Callback,
+            user_data: u128,
+            message: *Message.Request,
+        ) void {
             assert(self.inflight == null);
             self.inflight = .{
                 .message = message,

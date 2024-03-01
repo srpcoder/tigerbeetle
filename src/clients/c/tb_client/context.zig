@@ -1,26 +1,22 @@
 const std = @import("std");
 const os = std.os;
 const assert = std.debug.assert;
-
 const Atomic = std.atomic.Atomic;
 
 const constants = @import("../../../constants.zig");
 const log = std.log.scoped(.tb_client_context);
-
 const stdx = @import("../../../stdx.zig");
 const vsr = @import("../../../vsr.zig");
 const Header = vsr.Header;
 
+const FIFO = @import("../../../fifo.zig").FIFO;
 const IO = @import("../../../io.zig").IO;
 const message_pool = @import("../../../message_pool.zig");
-
 const MessagePool = message_pool.MessagePool;
 const Message = MessagePool.Message;
 
 const Packet = @import("packet.zig").Packet;
 const Signal = @import("signal.zig").Signal;
-const ThreadType = @import("thread.zig").ThreadType;
-
 const api = @import("../tb_client.zig");
 const tb_status_t = api.tb_status_t;
 const tb_client_t = api.tb_client_t;
@@ -54,8 +50,8 @@ pub fn ContextType(
 ) type {
     return struct {
         const Context = @This();
-        const Thread = ThreadType(Context);
 
+        const StateMachine = Client.StateMachine;
         const UserData = extern struct {
             self: *Context,
             packet: *Packet,
@@ -66,7 +62,7 @@ pub fn ContextType(
         }
 
         fn operation_event_size(op: u8) ?usize {
-            const allowed_operations = [_]Client.StateMachine.Operation{
+            const allowed_operations = [_]StateMachine.Operation{
                 .create_accounts,
                 .create_transfers,
                 .lookup_accounts,
@@ -76,7 +72,7 @@ pub fn ContextType(
             };
             inline for (allowed_operations) |operation| {
                 if (op == @intFromEnum(operation)) {
-                    return @sizeOf(Client.StateMachine.Event(operation));
+                    return @sizeOf(StateMachine.Event(operation));
                 }
             }
             return null;
@@ -92,6 +88,7 @@ pub fn ContextType(
         client_id: u128,
         packets: []Packet,
         packets_free: Packet.ConcurrentStack,
+        packets_pending: FIFO(Packet),
 
         addresses: []const std.net.Address,
         io: IO,
@@ -100,8 +97,11 @@ pub fn ContextType(
 
         completion_fn: tb_completion_t,
         implementation: ContextImplementation,
-        thread: Thread,
-        shutdown: Atomic(bool) = Atomic(bool).init(false),
+
+        signal: Signal,
+        submitted: Packet.SubmissionStack,
+        shutdown: Atomic(bool),
+        thread: std.Thread,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -130,6 +130,7 @@ pub fn ContextType(
             context.packets = try context.allocator.alloc(Packet, concurrency_max);
             errdefer context.allocator.free(context.packets);
 
+            context.packets_pending = .{ .name = null };
             context.packets_free = .{};
             for (context.packets) |*packet| {
                 context.packets_free.push(packet);
@@ -191,9 +192,28 @@ pub fn ContextType(
                 .deinit_fn = Context.on_deinit,
             };
 
+            log.debug("{}: init: initializing signal", .{context.client_id});
+            try context.signal.init(&context.io, Context.on_signal);
+            errdefer context.signal.deinit();
+
+            context.submitted = .{};
+            context.shutdown = Atomic(bool).init(false);
+
             log.debug("{}: init: initializing thread", .{context.client_id});
-            try context.thread.init(context);
-            errdefer context.thread.deinit(context.allocator);
+            context.thread = std.Thread.spawn(.{}, Context.run, .{context}) catch |err| {
+                log.err("{}: failed to spawn thread: {s}", .{
+                    context.client_id,
+                    @errorName(err),
+                });
+                return switch (err) {
+                    error.Unexpected => error.Unexpected,
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.SystemResources,
+                    error.ThreadQuotaExceeded,
+                    error.LockedMemoryLimitExceeded,
+                    => error.SystemResources,
+                };
+            };
 
             return context;
         }
@@ -201,7 +221,8 @@ pub fn ContextType(
         pub fn deinit(self: *Context) void {
             const is_shutdown = self.shutdown.swap(true, .Monotonic);
             if (!is_shutdown) {
-                self.thread.deinit();
+                self.thread.join();
+                self.signal.deinit();
 
                 self.client.deinit(self.allocator);
                 self.message_pool.deinit(self.allocator);
@@ -243,51 +264,153 @@ pub fn ContextType(
             }
         }
 
-        pub fn request(self: *Context, packet: *Packet) error{TooManyOutstanding}!void {
+        fn on_signal(signal: *Signal) void {
+            const self = @fieldParentPtr(Context, "signal", signal);
+            while (self.submitted.pop()) |packet| {
+                self.request(packet);
+            }
+        }
+
+        fn request(self: *Context, packet: *Packet) void {
             // Get the size of each request structure in the packet.data:
             const event_size: usize = operation_event_size(packet.operation) orelse {
                 return self.on_complete(packet, error.InvalidOperation);
             };
 
             // Make sure the packet.data size is correct:
-            const readable = @as([*]const u8, @ptrCast(packet.data))[0..packet.data_size];
-            if (readable.len == 0 or readable.len % event_size != 0) {
+            if (packet.data == null or packet.data_size == 0 or packet.data_size % event_size != 0) {
                 return self.on_complete(packet, error.InvalidDataSize);
             }
 
             // Make sure the packet.data wouldn't overflow a message:
-            if (readable.len > constants.message_body_size_max) {
+            if (packet.data_size > constants.message_body_size_max) {
                 return self.on_complete(packet, error.TooMuchData);
             }
 
-            // TODO: Client batching and Demuxing.
+            // The root packet which represents a Message holds the batch linked list + batch size.
+            packet.batch_link = null;
+            packet.batch_data = packet.data_size;
+
+            // self.client currently processing an existing packet so we must queue this for later.
             if (self.client.inflight_message() != null) {
-                return error.TooManyOutstanding;
+                // If the StateMachine supports it, try to batch this packet with an existing one.
+                if (StateMachine.batch_logical_allowed.get(@enumFromInt(packet.operation))) {
+                    var pending = self.packets_pending.peek();
+                    while (pending) |p| {
+                        pending = p.next;
+                        if (p.operation != packet.operation) continue;
+                        if (p.batch_data + packet.data_size > constants.message_size_max) continue;
+
+                        // Found one, push the packet to its batched linked list.
+                        // Root node p.batch_data holds total msg body size (updated below).
+                        // p.batch_link.?.batch_data holds pointer to the tail node of the queue.
+                        if (p.batch_link) |p_next| {
+                            @as(*Packet, @ptrFromInt(p_next.batch_data)).batch_link = packet;
+                            p_next.batch_data = @intFromPtr(packet);
+                        } else {
+                            p.batch_link = packet;
+                            packet.batch_data = @intFromPtr(packet);
+                        }
+
+                        p.batch_data += packet.data_size;
+                        return;
+                    }
+                }
+
+                // The packet cannot be batched so it becomes a root node in the queue instead.
+                return self.packets_pending.push(packet);
             }
 
-            // Submit the message for processing:
-            self.client.request(
+            // Submit the packet directly do the vsr.Client.
+            self.submit(packet);
+        }
+
+        fn submit(self: *Context, packet: *Packet) void {
+            assert(self.client.inflight_message() == null);
+            assert(packet.batch_data <= constants.message_body_size_max);
+
+            const message = self.client.get_message().build(.request);
+            errdefer self.client.release(message);
+
+            const operation: StateMachine.Operation = @enumFromInt(packet.operation);
+            message.header.* = .{
+                .client = self.client.id,
+                .request = undefined, // Set during raw_request() below.
+                .cluster = self.client.cluster,
+                .command = .request,
+                .operation = vsr.Operation.from(StateMachine, operation),
+                .size = @intCast(@sizeOf(Header) + packet.batch_data),
+            };
+
+            // Copy the batched packet datas into the message.
+            var offset: usize = 0;
+            var batched: ?*Packet = packet;
+            while (batched) |p| {
+                batched = p.batch_link;
+
+                const event_data = @as([*]const u8, @ptrCast(p.data.?))[0..packet.data_size];
+                stdx.copy_disjoint(.inexact, u8, message.body()[offset..], event_data);
+                offset += event_data.len;
+            }
+
+            assert(offset == packet.batch_data);
+            self.client.raw_request(
                 Context.on_result,
                 @bitCast(UserData{
                     .self = self,
                     .packet = packet,
                 }),
-                @enumFromInt(packet.operation),
-                readable,
+                message,
             );
         }
 
         fn on_result(
             raw_user_data: u128,
             op: Client.StateMachine.Operation,
-            results: []const u8,
+            reply: []const u8,
         ) void {
             const user_data: UserData = @bitCast(raw_user_data);
             const self = user_data.self;
             const packet = user_data.packet;
 
+            // Start the next packet that was queued up.
+            if (self.packets_pending.pop()) |next_packet| {
+                self.submit(next_packet);
+            }
+
+            // Demux the results
             assert(packet.operation == @intFromEnum(op));
-            self.on_complete(packet, results);
+            switch (op) {
+                inline else => |operation| {
+                    const results = std.mem.bytesAsSlice(StateMachine.Result(operation), reply);
+                    var demuxer = StateMachine.DemuxerType(operation).init(
+                        // Demuxer expects mutable result memory but Client passes []const u8.
+                        // This []const u8 comes directly from a Message.body() however, so it
+                        // should be safe to @alignCast() for Result and @constCast() for mutation.
+                        @constCast(@alignCast(results)),
+                    );
+
+                    var event_offset: u32 = 0;
+                    var batched: ?*Packet = packet;
+                    while (batched) |p| {
+                        batched = p.batch_link;
+
+                        // Slice out the decoded chunk corresponding to this packet (p).
+                        const event_size = @sizeOf(StateMachine.Event(operation));
+                        const event_count = @divExact(p.data_size, event_size);
+                        const decoded = demuxer.decode(event_offset, event_count);
+                        event_offset += event_count;
+
+                        // Interpret as bytes, making sure non-batched ops consume the entire reply.
+                        const result = std.mem.sliceAsBytes(decoded);
+                        if (!StateMachine.batch_logical_allowed.get(operation)) {
+                            assert(result.len == reply.len);
+                        }
+
+                        self.on_complete(p, result);
+                    }
+                },
+            }
         }
 
         fn on_complete(
@@ -297,9 +420,6 @@ pub fn ContextType(
         ) void {
             const completion_ctx = self.implementation.completion_ctx;
             assert(self.client.messages_available <= constants.client_request_queue_max);
-
-            // Signal to resume sending requests that was waiting for available messages.
-            self.thread.signal.notify();
 
             const tb_client = api.context_to_client(&self.implementation);
             const bytes = result catch |err| {
@@ -336,18 +456,19 @@ pub fn ContextType(
         }
 
         fn on_release_packet(implementation: *ContextImplementation, packet: *Packet) void {
-            const context = get_context(implementation);
-            return context.packets_free.push(packet);
+            const self = get_context(implementation);
+            return self.packets_free.push(packet);
         }
 
         fn on_submit(implementation: *ContextImplementation, packet: *Packet) void {
-            const context = get_context(implementation);
-            context.thread.submit(packet);
+            const self = get_context(implementation);
+            self.submitted.push(packet);
+            self.signal.notify();
         }
 
         fn on_deinit(implementation: *ContextImplementation) void {
-            const context = get_context(implementation);
-            context.deinit();
+            const self = get_context(implementation);
+            self.deinit();
         }
     };
 }
