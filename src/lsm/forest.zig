@@ -20,6 +20,7 @@ const CompactionInterfaceType = @import("compaction.zig").CompactionInterfaceTyp
 const CompactionHelperType = @import("compaction.zig").CompactionHelperType;
 const BlipStage = @import("compaction.zig").BlipStage;
 const Exhausted = @import("compaction.zig").Exhausted;
+const snapshot_min_for_table_output = @import("compaction.zig").snapshot_min_for_table_output;
 
 const table_count_max = @import("tree.zig").table_count_max;
 
@@ -270,7 +271,8 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 const blocks = self.compaction_blocks;
 
                 assert(blocks.len >= minimum_block_count);
-                for (blocks) |*block| {
+                // FIXME: Giant hack since we reserve the upper space for bar scoped blocks!
+                for (blocks[0..100]) |*block| {
                     block.next = null;
                 }
 
@@ -303,10 +305,6 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 self.slot_filled_count = 0;
                 self.slot_running_count = 0;
 
-                if (op == 70) {
-                    // assert(false);
-                }
-
                 if (first_beat) {
                     self.active_bar = CompactionBitset.initEmpty();
 
@@ -314,7 +312,12 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                         // A compaction is marked as live at the start of a bar.
                         self.active_bar.set(i);
 
-                        const blocks = self.compaction_blocks[900 + i .. 900 + i + 2];
+                        // FIXME: It's very easy to mess up the ranges, and give overlapping blocks. To be able to assert
+                        // that all our blocks are distinct would be great. Both here, and for the beat blocks set up
+                        // by divide_blocks...
+                        // I've already wasted enough time on a problem I knew about :D
+                        std.log.info("Index block range is: [{}..{}]", .{ 900 + i * 2, 900 + i * 2 + 2 });
+                        const blocks = self.compaction_blocks[900 + i * 2 .. 900 + i * 2 + 2];
 
                         for (blocks) |*block| {
                             block.next = null;
@@ -437,14 +440,14 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                     return;
                 }
 
-                log.info("----------------------------------------------------", .{});
                 log.info("blip_callback: all slots joined - advancing pipeline", .{});
                 pipeline.advance_pipeline();
             }
 
             fn advance_pipeline(self: *CompactionPipeline) void {
+                log.info("--------------------------------------------------------------------------------------------------------", .{});
                 const active_compaction_index = self.active_beat.findFirstSet() orelse {
-                    log.info("advance_pipeline: All compactions finished! Calling handler.", .{});
+                    log.info("advance_pipeline: All compactions finished! Calling beat_finished_next_tick().", .{});
                     self.grid.on_next_tick(beat_finished_next_tick, &self.next_tick);
                     return;
                 };
@@ -459,14 +462,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                         .read => {
                             assert(cpu == null);
 
-                            if (self.exhausted_beat) {
-                                // If we hit exhausted_beat, it means that we need to discard the
-                                // results of this read by rolling back the internal state.
-                                // FIXME: This is subject to the new streaming / iterator blip
-                                // read style.
-                                // log.info("!!!!!!!!!! doing undo_blip_read()", .{});
-                                // slot.interface.undo_blip_read();
-                            } else {
+                            if (!self.exhausted_beat) {
                                 // Only start CPU work after read if we're not exhausted.
                                 cpu = i;
                             }
@@ -521,7 +517,6 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                         .compaction_index = active_compaction_index,
                     };
 
-                    // FIXME: Assert beat_blocks_assign is only called once in compaction?
                     if (slot_idx == 0) {
                         self.slots[slot_idx].?.interface.beat_blocks_assign(
                             self.divide_blocks(),
@@ -545,7 +540,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                     log.info("Pipeline has {} filled slots and is in .filling - but beat exhausted so not filling.", .{self.slot_filled_count});
                 }
 
-                // Now that IO is done, start CPU work if there was any.
+                // Now that IO has been dispatched, start CPU work if there was any.
                 if (cpu) |cpu_slot| {
                     const slot = &self.slots[cpu_slot].?;
 
@@ -746,7 +741,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             const compaction_beat = op % constants.lsm_batch_multiple;
 
             // Note: The first beat of the first bar is a special case. It has op 1, and so
-            // no bar_setup is called. bar_finish compensates for this internally currently.
+            // no bar_setup is called. bar_apply_to_manifest compensates for this internally currently.
             const first_beat = compaction_beat == 0;
             const last_beat = compaction_beat == constants.lsm_batch_multiple - 1;
 
@@ -765,7 +760,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
                         // FIXME: Big hack to limit to a single tree for debugging! This only
                         // compacts the Account object tree and discards the rest.
-                        // if (tree_id != 2) {
+                        // if (tree_id != 3) {
                         //     tree.table_immutable.mutability.immutable.flushed = true;
                         // } else {
                         assert(tree.compactions.len == constants.lsm_levels);
@@ -818,15 +813,9 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             if (forest.compaction_progress == .trees_and_manifest)
                 assert(forest.manifest_log_progress != .idle);
 
-            std.log.info("inside compact_callback...", .{});
-
+            std.log.info("In callback, progress is: {s}", .{@tagName(forest.compaction_progress)});
             forest.compaction_progress = if (forest.compaction_progress == .trees_and_manifest) .trees_or_manifest else .idle;
-
-            if (forest.compaction_progress != .idle) {
-                return;
-            }
-
-            std.log.info("inside compact_callback joined...", .{});
+            if (forest.compaction_progress != .idle) return;
 
             forest.verify_table_extents();
 
@@ -849,7 +838,13 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                         assert(tree.compactions.len == constants.lsm_levels);
 
                         var compaction = &tree.compactions[level_b];
-                        compaction.bar_finish(op, tree);
+                        if (compaction.bar != null) compaction.bar_apply_to_manifest();
+
+                        if (level_b == 0) {
+                            tree.swap_mutable_and_immutable(
+                                snapshot_min_for_table_output(op + 1),
+                            );
+                        }
                     }
                 }
 
@@ -878,7 +873,6 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             const callback = progress.callback;
             forest.progress = null;
 
-            std.log.info("inside calling callback??...", .{});
             callback(forest);
         }
 

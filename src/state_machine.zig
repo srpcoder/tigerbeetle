@@ -923,8 +923,6 @@ pub fn StateMachineType(
             const callback = self.compact_callback.?;
             self.compact_callback = null;
 
-            std.log.info("In compact_finish state machine??", .{});
-
             tracer.end(
                 &self.tracer_slot,
                 .state_machine_compact,

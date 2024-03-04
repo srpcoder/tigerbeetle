@@ -107,7 +107,7 @@ pub fn TableMemoryType(comptime Table: type) type {
                 return self.table_memory.count();
             }
 
-            pub fn remaining(self: *const Iterator) usize {
+            pub fn remaining_in_memory(self: *const Iterator) usize {
                 return self.table_memory.count() - self.source_index;
             }
 
