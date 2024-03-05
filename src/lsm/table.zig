@@ -332,8 +332,6 @@ pub fn TableType(
                 header.set_checksum_body(block[@sizeOf(vsr.Header)..header.size]);
                 header.set_checksum();
 
-                std.log.info("finished a data block @ {} # {} #b {}", .{ header.address, header.checksum, header.checksum_body });
-
                 const values = Table.data_block_values_used(block);
                 { // Now that we have checksummed the block, sanity-check the result:
 
@@ -356,6 +354,7 @@ pub fn TableType(
                     assert(key_min < key);
                     break :blk key;
                 };
+                std.log.info("setting key_max to: {}", .{key_max});
 
                 const current = builder.data_block_count;
                 { // Update the index block:
@@ -365,6 +364,8 @@ pub fn TableType(
                     index.data_checksums(builder.index_block)[current] =
                         .{ .value = header.checksum };
                 }
+
+                std.log.info("finished a data block @ {} # {} #b {} - in index block pos: {}", .{ header.address, header.checksum, header.checksum_body, current });
 
                 if (current == 0) builder.key_min = key_min;
                 builder.key_max = key_max;
@@ -379,6 +380,7 @@ pub fn TableType(
                 if (current > 0) {
                     const slice = index_data_keys(builder.index_block, .key_max);
                     const key_max_prev = slice[current - 1];
+                    std.log.info("key_max_prev: {} current: {}", .{ key_max_prev, key_from_value(&values[0]) });
                     assert(key_max_prev < key_from_value(&values[0]));
                 }
 

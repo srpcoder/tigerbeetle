@@ -274,16 +274,16 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
                 assert(blocks.len >= minimum_block_count);
                 // FIXME: Giant hack since we reserve the upper space for bar scoped blocks!
-                for (blocks[0..100]) |*block| {
+                for (blocks[0..700]) |*block| {
                     block.next = null;
                 }
 
                 const source_index_blocks = blocks[0..10];
 
                 const source_value_level_a = blocks[10..][0..10];
-                const source_value_level_b = blocks[20..][0..4];
+                const source_value_level_b = blocks[20..][0..100];
 
-                const target_value_blocks = blocks[30..][0..10];
+                const target_value_blocks = blocks[200..][0..10];
 
                 return .{
                     .source_index_blocks = source_index_blocks,
@@ -563,7 +563,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 }
             }
 
-            fn beat_end(self: *CompactionPipeline) void {
+            fn beat_grid_forfeit_all(self: *CompactionPipeline) void {
                 var i = self.compactions.count();
                 while (i > 0) {
                     i -= 1;
@@ -840,27 +840,40 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             const compaction_beat = op % constants.lsm_batch_multiple;
             const last_beat = compaction_beat == constants.lsm_batch_multiple - 1;
 
-            // Finish all our compactions.
-            forest.compaction_pipeline.beat_end();
+            // Forfeit any remaining grid reservations.
+            forest.compaction_pipeline.beat_grid_forfeit_all();
 
-            // Finish loop, runs only on the last beat of every bar, after all async work is done.
-            if (last_beat) {
-                inline for (0..constants.lsm_levels) |level_b| {
-                    inline for (tree_id_range.min..tree_id_range.max) |tree_id| {
+            // Apply the changes to the manifest. This will run at the target compaction beat
+            // that is requested.
+            inline for (0..constants.lsm_levels) |level_b| {
+                inline for (tree_id_range.min..tree_id_range.max) |tree_id| {
+                    // FIXME: make this last_beat dependent on what we want!
+                    if (last_beat) {
                         var tree = tree_for_id(forest, tree_id);
                         assert(tree.compactions.len == constants.lsm_levels);
 
                         var compaction = &tree.compactions[level_b];
                         if (compaction.bar != null) compaction.bar_apply_to_manifest();
-
-                        if (level_b == 0) {
-                            tree.swap_mutable_and_immutable(
-                                snapshot_min_for_table_output(op + 1),
-                            );
-                        }
                     }
                 }
+            }
 
+            // Swap the mutable and immutable tables; this must happen on the last beat, regardless
+            // of pacing.
+            if (last_beat) {
+                inline for (tree_id_range.min..tree_id_range.max) |tree_id| {
+                    const tree = tree_for_id(forest, tree_id);
+
+                    tree.swap_mutable_and_immutable(
+                        snapshot_min_for_table_output(op + 1),
+                    );
+
+                    // Ensure tables haven't overflowed.
+                    tree.manifest.assert_level_table_counts();
+                }
+
+                // While we're here, check that all compactions have finished by the last beat, and
+                // reset our pipeline state.
                 assert(forest.compaction_pipeline.active_bar.count() == 0);
                 forest.compaction_pipeline.compactions.clear();
             }
