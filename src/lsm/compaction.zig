@@ -73,11 +73,15 @@ pub const CompactionInfo = struct {
     // here, instead of Key, to keep this unspecalized.
     target_key_min: u128,
     target_key_max: u128,
+
+    /// Are we doing a move_table? In which case, certain things like grid reservation
+    /// must be skipped by the caller.
+    move_table: bool,
 };
 
 pub const Exhausted = struct { bar: bool, beat: bool };
 const BlipCallback = *const fn (*anyopaque, ?Exhausted) void;
-pub const BlipStage = enum { read, merge, write };
+pub const BlipStage = enum { read, merge, write, drained };
 
 // The following types need to specalize on Grid, but are used both by CompactionType and the
 // forest.
@@ -612,6 +616,7 @@ pub fn CompactionType(
                         };
                         self.write.?.timer.reset();
                     },
+                    .drained => unreachable,
                 }
             }
 
@@ -654,6 +659,7 @@ pub fn CompactionType(
 
                         callback(ptr, exhausted);
                     },
+                    .drained => unreachable,
                 }
             }
 
@@ -752,7 +758,6 @@ pub fn CompactionType(
 
                 compaction_tables_value_count += values_count;
                 for (range_b.tables.const_slice()) |*table| {
-                    std.log.info("XXXXXXXXXXXXXX values coming from range_b: {}", .{table.table_info.value_count});
                     compaction_tables_value_count += table.table_info.value_count;
                 }
 
@@ -800,13 +805,11 @@ pub fn CompactionType(
                 for (range_b.tables.const_slice()) |*table|
                     compaction_tables_value_count += table.table_info.value_count;
 
-                const perform_move_table = range_b.tables.empty();
-
                 compaction.bar = .{
                     .tree = tree,
                     .op_min = op,
 
-                    .move_table = perform_move_table,
+                    .move_table = range_b.tables.empty(),
                     .table_info_a = .{ .disk = table_range.table_a },
                     .range_b = range_b,
                     .drop_tombstones = tree.manifest.compaction_must_drop_tombstones(
@@ -822,12 +825,24 @@ pub fn CompactionType(
                     .beats_max = null,
                 };
 
-                // Return null if move_table is used. We still need to set our bar state above, as
-                // it's what keeps track of the manifest updates to be applied synchronously at
-                // the end of the bar.
-                if (perform_move_table) {
-                    compaction.move_table();
-                    return null;
+                // Append the entries to the manifest update queue here and now if we're doing
+                // move table. They'll be applied later by bar_apply_to_manifest.
+                if (compaction.bar.?.move_table) {
+                    log.info(
+                        "{s}: Moving table: level_b={}",
+                        .{ compaction.tree_config.name, compaction.level_b },
+                    );
+
+                    const snapshot_max = snapshot_max_for_table_input(compaction.bar.?.op_min);
+                    assert(table_a.snapshot_max >= snapshot_max);
+
+                    compaction.bar.?.manifest_entries.append_assume_capacity(.{
+                        .operation = .move_to_level_b,
+                        .table = table_a.*,
+                    });
+
+                    // If we move the table, we've processed all the values in it.
+                    compaction.bar.?.source_values_processed = compaction.bar.?.compaction_tables_value_count;
                 }
             }
 
@@ -838,6 +853,7 @@ pub fn CompactionType(
                 .compaction_tables_value_count = compaction_tables_value_count,
                 .target_key_min = compaction.bar.?.range_b.key_min,
                 .target_key_max = compaction.bar.?.range_b.key_max,
+                .move_table = compaction.bar.?.move_table,
             };
         }
 
@@ -857,26 +873,19 @@ pub fn CompactionType(
             assert(compaction.beat == null);
 
             const bar = &compaction.bar.?;
+            assert(!bar.move_table);
 
             assert(bar.per_beat_input_goal == 0);
 
-            // FIXME: Actually move this calc into beat_grid_reserve, and subtract the values we've already done from it.
-            // This way we self correct our pacing!
             // FIXME: Naming of per_beat_input_goal: value_count_per_beat
             bar.per_beat_input_goal = stdx.div_ceil(bar.compaction_tables_value_count, beats_max);
+            assert(bar.per_beat_input_goal > 0);
+
             bar.target_index_blocks = target_index_blocks;
+            assert(target_index_blocks.count > 0);
 
-            if (bar.move_table) {
-                // FIXME: Asserts here
-                // assert(target_index_blocks.len == 0);
-                // assert(compaction.bar.?.per_beat_input_goal == 0);
-            } else {
-                // assert(target_index_blocks.len > 0);
-                assert(bar.per_beat_input_goal > 0);
-            }
-
-            // log.info("Set up budget: OI: [0][0]: {*}, [1][0]: {*}", .{ target_index_blocks[0][0], target_index_blocks[1][0] });
-
+            // FIXME: Actually move this calc into beat_grid_reserve, and subtract the values we've already done from it.
+            // This way we self correct our pacing!
             // FIXME: Ok, so this gets set once, but we do an extra value block. What we should do is recalculate this dynamically after each beat, to better spread
             // the work out....
             log.info("Total: {} per beat goal: {}", .{ bar.compaction_tables_value_count, bar.per_beat_input_goal });
@@ -896,10 +905,11 @@ pub fn CompactionType(
             assert(compaction.beat == null);
 
             const bar = &compaction.bar.?;
-            assert(bar.per_beat_input_goal > 0);
 
             // If we're move_table, only the manifest is being updated, *not* the grid.
             assert(!bar.move_table);
+
+            assert(bar.per_beat_input_goal > 0);
 
             const value_blocks_per_beat = stdx.div_ceil(
                 bar.per_beat_input_goal,
@@ -926,6 +936,7 @@ pub fn CompactionType(
             assert(compaction.bar != null);
             assert(compaction.beat != null);
             assert(compaction.beat.?.blocks == null);
+            assert(!compaction.bar.?.move_table);
 
             compaction.beat.?.blocks = blocks;
         }
@@ -966,6 +977,7 @@ pub fn CompactionType(
 
             assert(compaction.bar != null);
             assert(compaction.beat != null);
+            assert(compaction.bar.?.move_table == false);
 
             const beat = &compaction.beat.?;
             beat.activate_and_assert(.read, callback, ptr);
@@ -1240,6 +1252,7 @@ pub fn CompactionType(
         pub fn blip_merge(compaction: *Compaction, callback: BlipCallback, ptr: *anyopaque) void {
             assert(compaction.bar != null);
             assert(compaction.beat != null);
+            assert(compaction.bar.?.move_table == false);
 
             const bar = &compaction.bar.?;
             const beat = &compaction.beat.?;
@@ -1435,6 +1448,7 @@ pub fn CompactionType(
         pub fn blip_write(compaction: *Compaction, callback: BlipCallback, ptr: *anyopaque) void {
             assert(compaction.bar != null);
             assert(compaction.beat != null);
+            assert(compaction.bar.?.move_table == false);
 
             const bar = &compaction.bar.?;
             const beat = &compaction.beat.?;
@@ -1525,13 +1539,9 @@ pub fn CompactionType(
         }
 
         pub fn beat_grid_forfeit(compaction: *Compaction) void {
-            // FIXME: Big hack - see beat_end comment
-            if (compaction.beat == null) {
-                return;
-            }
-
             assert(compaction.bar != null);
             assert(compaction.beat != null);
+            assert(compaction.bar.?.move_table == false);
 
             const beat = &compaction.beat.?;
 
@@ -1617,29 +1627,6 @@ pub fn CompactionType(
 
             // Our bar is done!
             compaction.bar = null;
-        }
-
-        /// If we can just move the table, don't bother with merging.
-        fn move_table(compaction: *Compaction) void {
-            const bar = &compaction.bar.?;
-            assert(bar.move_table);
-
-            log.info(
-                "{s}: Moving table: level_b={}",
-                .{ compaction.tree_config.name, compaction.level_b },
-            );
-
-            const snapshot_max = snapshot_max_for_table_input(bar.op_min);
-            const table_a = bar.table_info_a.disk.table_info;
-            assert(table_a.snapshot_max >= snapshot_max);
-
-            bar.manifest_entries.append_assume_capacity(.{
-                .operation = .move_to_level_b,
-                .table = table_a.*,
-            });
-
-            // If we move the table, we've processed all the values in it.
-            bar.source_values_processed = bar.compaction_tables_value_count;
         }
 
         // TODO: Support for LSM snapshots would require us to only remove blocks
