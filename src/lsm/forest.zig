@@ -199,6 +199,8 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             reserved_beat: CompactionBitset = CompactionBitset.initEmpty(),
 
             exhausted_beat: bool = false,
+            exhauted_beat_next_1: bool = false,
+            exhauted_beat_next_2: bool = false,
 
             slots: [3]?PipelineSlot = .{ null, null, null },
             slot_filled_count: usize = 0,
@@ -279,17 +281,17 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 const source_index_blocks = blocks[0..10];
 
                 const source_value_level_a = blocks[10..][0..10];
-                const source_value_level_b = blocks[20..][0..10];
+                const source_value_level_b = blocks[20..][0..4];
 
                 const target_value_blocks = blocks[30..][0..10];
 
                 return .{
                     .source_index_blocks = source_index_blocks,
                     .source_value_blocks = .{
-                        CompactionHelper.BlockPool.init(source_value_level_a),
-                        CompactionHelper.BlockPool.init(source_value_level_b),
+                        CompactionHelper.BlockFIFO.init(source_value_level_a),
+                        CompactionHelper.BlockFIFO.init(source_value_level_b),
                     },
-                    .target_value_blocks = CompactionHelper.BlockPool.init(target_value_blocks),
+                    .target_value_blocks = CompactionHelper.BlockFIFO.init(target_value_blocks),
                 };
             }
 
@@ -324,7 +326,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                         }
 
                         // FIXME: These blocks need to be disjoint from all others. Any way we can assert that?
-                        const ring_buffer = CompactionHelper.BlockPool.init(blocks);
+                        const ring_buffer = CompactionHelper.BlockFIFO.init(blocks);
 
                         compaction.bar_setup_budget(constants.lsm_batch_multiple, ring_buffer);
                     }
@@ -420,6 +422,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                             "blip_callback: marking active_beat({}) to be unset...",
                             .{slot.compaction_index},
                         );
+
                     pipeline.exhausted_beat = exhausted.beat;
 
                     if (exhausted.bar) {
@@ -468,32 +471,22 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                             }
                         },
                         .merge => {
+                            if (self.exhausted_beat) {
+                                self.exhauted_beat_next_1 = true;
+                            }
                             slot.active_operation = .write;
                             self.slot_running_count += 1;
                             log.info("Slot {}, Compaction {}: Calling blip_write", .{ i, active_compaction_index });
                             slot.interface.blip_write(blip_callback);
                         },
                         .write => {
-                            if (self.exhausted_beat) {
-                                if (self.slot_running_count > 0) {
-                                    return;
-                                }
-
-                                // If we're in the input exhausted state, we have no more reads
-                                // that can be done, so don't schedule any more.
-                                log.info("... ... blip_callback: write done on exhausted beat. Moving to next compaction in sequence.", .{});
-
-                                // FIXME: Resetting these below variables like this sucks.
-                                self.active_beat.unset(slot.compaction_index);
-
-                                self.exhausted_beat = false;
-                                self.slot_filled_count = 0;
-                                assert(self.slot_running_count == 0);
-                                self.state = .filling;
-                                self.slots = .{ null, null, null };
-
-                                return self.advance_pipeline();
+                            if (self.exhauted_beat_next_1) {
+                                self.exhauted_beat_next_2 = true;
                             }
+                            if (self.exhausted_beat) {
+                                continue;
+                            }
+
                             log.info("... blip_callback: write done, starting read on {}.", .{i});
                             slot.active_operation = .read;
                             self.slot_running_count += 1;
@@ -538,6 +531,25 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                     }
                 } else if (self.state == .filling and self.exhausted_beat) {
                     log.info("Pipeline has {} filled slots and is in .filling - but beat exhausted so not filling.", .{self.slot_filled_count});
+                }
+
+                if (self.exhauted_beat_next_2) {
+                    // If we're in the input exhausted state, we have no more reads
+                    // that can be done, so don't schedule any more.
+                    log.info("... ... blip_callback: write done on exhausted beat. Moving to next compaction in sequence.", .{});
+
+                    // FIXME: Resetting these below variables like this sucks.
+                    self.active_beat.unset(self.slots[0].?.compaction_index);
+
+                    self.exhausted_beat = false;
+                    self.exhauted_beat_next_1 = false;
+                    self.exhauted_beat_next_2 = false;
+                    self.slot_filled_count = 0;
+                    assert(self.slot_running_count == 0);
+                    self.state = .filling;
+                    self.slots = .{ null, null, null };
+
+                    return self.advance_pipeline();
                 }
 
                 // Now that IO has been dispatched, start CPU work if there was any.
@@ -738,6 +750,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
         }
 
         pub fn compact(forest: *Forest, callback: Callback, op: u64) void {
+            std.log.info("Entering forest.compact()", .{});
             const compaction_beat = op % constants.lsm_batch_multiple;
 
             // Note: The first beat of the first bar is a special case. It has op 1, and so
@@ -813,7 +826,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             if (forest.compaction_progress == .trees_and_manifest)
                 assert(forest.manifest_log_progress != .idle);
 
-            std.log.info("In callback, progress is: {s}", .{@tagName(forest.compaction_progress)});
+            std.log.info("In callback, progress is: {s} manifest is: {s}", .{ @tagName(forest.compaction_progress), @tagName(forest.manifest_log_progress) });
             forest.compaction_progress = if (forest.compaction_progress == .trees_and_manifest) .trees_or_manifest else .idle;
             if (forest.compaction_progress != .idle) return;
 
@@ -872,6 +885,8 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
             const callback = progress.callback;
             forest.progress = null;
+
+            std.log.info("Ok finished compact_callback...", .{});
 
             callback(forest);
         }

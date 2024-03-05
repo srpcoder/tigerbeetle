@@ -332,6 +332,8 @@ pub fn TableType(
                 header.set_checksum_body(block[@sizeOf(vsr.Header)..header.size]);
                 header.set_checksum();
 
+                std.log.info("finished a data block @ {} # {} #b {}", .{ header.address, header.checksum, header.checksum_body });
+
                 const values = Table.data_block_values_used(block);
                 { // Now that we have checksummed the block, sanity-check the result:
 
@@ -440,6 +442,8 @@ pub fn TableType(
 
                 header.set_checksum_body(index_block[@sizeOf(vsr.Header)..header.size]);
                 header.set_checksum();
+
+                std.log.info("finished an index block @ {} # {} #b {}", .{ header.address, header.checksum, header.checksum_body });
 
                 const info: TreeTableInfo = .{
                     .checksum = header.checksum,

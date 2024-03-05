@@ -89,10 +89,10 @@ pub fn CompactionHelperType(comptime Grid: type) type {
             source_index_blocks: []CompactionBlock,
 
             /// For each source level, we have a buffer of CompactionBlocks.
-            source_value_blocks: [2]BlockPool,
+            source_value_blocks: [2]BlockFIFO,
 
             /// We only have one buffer of output CompactionBlocks.
-            target_value_blocks: BlockPool,
+            target_value_blocks: BlockFIFO,
         };
 
         pub const CompactionBlock = struct {
@@ -102,28 +102,29 @@ pub fn CompactionHelperType(comptime Grid: type) type {
             // parent.
             target: ?*anyopaque = null,
 
-            // FIXME: This can very much be a union in future!
+            // TODO: This could be a union to save a bit of memory and add a bit of safety.
             read: Grid.Read = undefined,
             write: Grid.Write = undefined,
 
             next: ?*CompactionBlock = null,
         };
 
-        pub const BlockPool = struct {
-            const BlockFIFO = FIFO(CompactionBlock);
+        pub const BlockFIFO = struct {
+            const Inner = FIFO(CompactionBlock);
 
-            free: BlockFIFO,
-            pending: BlockFIFO,
-            ready: BlockFIFO,
+            free: Inner,
+            pending: Inner,
+            ready: Inner,
+
             count: usize,
 
             state: enum { free_to_pending, pending_to_ready, ready_to_free } = .free_to_pending,
 
             /// All blocks start in free.
-            pub fn init(blocks: []CompactionBlock) BlockPool {
+            pub fn init(blocks: []CompactionBlock) BlockFIFO {
                 assert(blocks.len % 2 == 0);
 
-                var free: BlockFIFO = .{
+                var free: Inner = .{
                     .name = "free",
                 };
 
@@ -139,7 +140,7 @@ pub fn CompactionHelperType(comptime Grid: type) type {
                 };
             }
 
-            pub fn free_to_pending(self: *BlockPool) ?*CompactionBlock {
+            pub fn free_to_pending(self: *BlockFIFO) ?*CompactionBlock {
                 // assert(self.state == .ready_to_free or self.state == .free_to_pending);
                 self.state = .free_to_pending;
 
@@ -149,7 +150,7 @@ pub fn CompactionHelperType(comptime Grid: type) type {
                 return value;
             }
 
-            pub fn pending_to_ready(self: *BlockPool) ?*CompactionBlock {
+            pub fn pending_to_ready(self: *BlockFIFO) ?*CompactionBlock {
                 // assert(self.state == .free_to_pending or self.state == .pending_to_ready);
                 self.state = .pending_to_ready;
 
@@ -159,7 +160,7 @@ pub fn CompactionHelperType(comptime Grid: type) type {
                 return value;
             }
 
-            pub fn ready_to_free(self: *BlockPool) ?*CompactionBlock {
+            pub fn ready_to_free(self: *BlockFIFO) ?*CompactionBlock {
                 // assert(self.state == .pending_to_ready or self.state == .ready_to_free);
                 self.state = .ready_to_free;
 
@@ -235,7 +236,7 @@ pub fn CompactionInterfaceType(comptime Grid: type, comptime tree_infos: anytype
             };
         }
 
-        pub fn bar_setup_budget(self: *const Self, beats_max: u64, target_index_blocks: Helpers.BlockPool) void {
+        pub fn bar_setup_budget(self: *const Self, beats_max: u64, target_index_blocks: Helpers.BlockFIFO) void {
             return switch (self.dispatcher) {
                 inline else => |compaction_impl| compaction_impl.bar_setup_budget(beats_max, target_index_blocks),
             };
@@ -308,29 +309,29 @@ pub fn CompactionType(
         };
 
         // THis name tho :(
-        /// The BlockPoolValueIterator has a lifetime over the entire bar, but its backing
-        /// buffer (the BlockPool) only has a lifetime of a beat. The BlockPool is refilled,
+        /// The BlockFIFOValueIterator has a lifetime over the entire bar, but its backing
+        /// buffer (the BlockFIFO) only has a lifetime of a beat. The BlockFIFO is refilled,
         /// out of band, such that the head at the active element is the block we need to start
         /// with.
-        const BlockPoolValueIterator = struct {
+        const BlockFIFOValueIterator = struct {
             const Position = struct {
                 value_block: usize = 0,
                 value_block_index: usize = 0,
             };
 
-            buffer: ?*Helpers.BlockPool = null,
+            buffer: ?*Helpers.BlockFIFO = null,
             position: Position = .{},
 
             // Used to assert we yield values in correct order. Perhaps gate on verify.
             last_value: ?Value = null,
 
-            pub fn init() BlockPoolValueIterator {
+            pub fn init() BlockFIFOValueIterator {
                 return .{};
             }
 
             /// Returns the number of values that are in memory (_not_ the total number of values
             /// remaining).
-            pub fn remaining_in_memory(self: *BlockPoolValueIterator) usize {
+            pub fn remaining_in_memory(self: *BlockFIFOValueIterator) usize {
                 assert(self.buffer != null);
 
                 if (self.buffer.?.ready.empty()) return 0;
@@ -348,7 +349,7 @@ pub fn CompactionType(
             }
 
             // FIXME: Ignoring performance for now, lets do it naively.
-            pub fn next(self: *BlockPoolValueIterator) ?Value {
+            pub fn next(self: *BlockFIFOValueIterator) ?Value {
                 assert(self.buffer != null);
 
                 var head = self.buffer.?.ready.peek().?;
@@ -376,13 +377,13 @@ pub fn CompactionType(
                 return value;
             }
 
-            pub fn buffer_set(self: *BlockPoolValueIterator, buffer: *Helpers.BlockPool) void {
+            pub fn buffer_set(self: *BlockFIFOValueIterator, buffer: *Helpers.BlockFIFO) void {
                 assert(self.buffer == null);
 
                 self.buffer = buffer;
             }
 
-            pub fn buffer_clear(self: *BlockPoolValueIterator) void {
+            pub fn buffer_clear(self: *BlockFIFOValueIterator) void {
                 assert(self.buffer != null);
                 self.buffer = null;
             }
@@ -429,7 +430,7 @@ pub fn CompactionType(
             /// * It encompasses all possible values, so we don't need to worry about reading more.
             source_a: union(enum) {
                 immutable: Tree.TableMemory.Iterator,
-                disk: BlockPoolValueIterator,
+                disk: BlockFIFOValueIterator,
 
                 pub fn remaining_in_memory(self: *@This()) usize {
                     switch (self.*) {
@@ -447,11 +448,12 @@ pub fn CompactionType(
             },
 
             /// level_b always comes from disk, and a bar always starts at (0, 0, 0).
-            source_b: BlockPoolValueIterator = .{},
+            source_b_index_block: usize = 0,
+            source_b: BlockFIFOValueIterator = .{},
 
             /// At least 2 output index blocks needs to span beat boundaries, otherwise it wouldn't be
             /// possible to pace at a more granular level than tables.
-            target_index_blocks: ?Helpers.BlockPool,
+            target_index_blocks: ?Helpers.BlockFIFO,
 
             /// Manifest log appends are queued up until `finish()` is explicitly called to ensure
             /// they are applied deterministically relative to other concurrent compactions.
@@ -795,7 +797,7 @@ pub fn CompactionType(
         /// Output index blocks are special, and are allocated at a bar level unlike all the other blocks
         /// which are done at a beat level. This is because while we can ensure we fill a value block, index
         /// blocks are too infrequent (one per table) to divide compaction by.
-        pub fn bar_setup_budget(compaction: *Compaction, beats_max: u64, target_index_blocks: Helpers.BlockPool) void {
+        pub fn bar_setup_budget(compaction: *Compaction, beats_max: u64, target_index_blocks: Helpers.BlockFIFO) void {
             assert(beats_max <= constants.lsm_batch_multiple);
             assert(compaction.bar != null);
             assert(compaction.beat == null);
@@ -1054,18 +1056,16 @@ pub fn CompactionType(
 
             // Read data for our tables in range b, which will always come from disk.
             const table_b_count = bar.range_b.tables.count();
-
-            var source_b_value_blocks = &beat.blocks.?.source_value_blocks[1];
-            _ = source_b_value_blocks;
             var previous_schema: ?schema.TableIndex = null;
-            var current_table_b_index_block_index: usize = 0; // FIXME: Hardcoded to 0 for now.
 
             assert(beat.blocks.?.source_value_blocks[1].pending.empty());
+            assert(table_b_count == 0 or table_b_count == 1);
 
-            // table_loop: while (current_table_b_index_block_index < table_b_count) : (current_table_b_index_block_index += 1) {
+            // table_loop: while (bar.source_b_index_block < table_b_count) : (bar.source_b_index_block += 1) {
             if (table_b_count == 1) {
                 // The 1 + is to skip over the table a index block.
-                const index_block = beat.blocks.?.source_index_blocks[1 + current_table_b_index_block_index].block;
+                std.log.info("table_loop running", .{});
+                const index_block = beat.blocks.?.source_index_blocks[1 + bar.source_b_index_block].block;
                 const index_schema = schema.TableIndex.from(index_block);
                 assert(previous_schema == null or stdx.equal_bytes(schema.TableIndex, &previous_schema.?, &index_schema));
                 previous_schema = index_schema;
@@ -1074,10 +1074,10 @@ pub fn CompactionType(
                 const value_block_addresses = index_schema.data_addresses_used(index_block);
                 const value_block_checksums = index_schema.data_checksums_used(index_block);
 
-                // std.log.info(".... this current_table_b_index_block_index({}) has {} used value blocks. We are on {}", .{ current_table_b_index_block_index, value_blocks_used, bar.current_table_b_value_block_index });
+                // std.log.info(".... this bar.source_b_index_block({}) has {} used value blocks. We are on {}", .{ bar.source_b_index_block, value_blocks_used, bar.current_table_b_value_block_index });
                 // assert(bar.current_table_b_value_block_index < value_blocks_used);
                 // Try read in as many value blocks as this index block has...
-                var i: usize = bar.source_b.position.value_block;
+                var i: usize = bar.source_b.position.value_block + beat.blocks.?.source_value_blocks[1].ready.count;
                 var maybe_source_value_block = beat.blocks.?.source_value_blocks[1].free_to_pending();
 
                 // FIXME: Need to only use /2 of our blocks!
@@ -1085,7 +1085,7 @@ pub fn CompactionType(
                     const source_value_block = maybe_source_value_block.?;
 
                     source_value_block.target = compaction;
-                    log.info("blip_read(): Issuing a value read for 0x{x}", .{@intFromPtr(source_value_block.block)});
+                    log.info("blip_read(): Issuing a value read for [{}][{}] into 0x{x}", .{ bar.source_b_index_block, i, @intFromPtr(source_value_block.block) });
                     compaction.grid.read_block(
                         .{ .from_local_or_global_storage = blip_read_data_callback },
                         &source_value_block.read,
@@ -1099,18 +1099,16 @@ pub fn CompactionType(
                     if (i < value_blocks_used) {
                         maybe_source_value_block = beat.blocks.?.source_value_blocks[1].free_to_pending();
                     }
-                    // bar.current_table_b_value_block_index += 1;
 
                     // But, once our read buffer is full, break out of the outer loop.
-                    // if (value_blocks_read_b == beat.blocks.source_value_blocks[beat.read_split][1].len) {
-                    //     break; //:table_loop;
+                    // if (maybe_source_value_block == null) {
+                    //     break :table_loop;
                     // }
                 }
 
-                // If we're here, it means we're incrementing our active index block. Reset the value block index to 0 too
-                // bar.current_table_b_value_block_index = 0;
-            } else {
-                assert(table_b_count == 0);
+                //     // If we're here, it means we're incrementing our active index block. Reset the value block index to 0 too.
+                //     std.log.info("Resetting source_b.position", .{});
+                //     bar.source_b.position = .{};
             }
 
             log.info("blip_read(): Scheduled {} data reads.", .{read.pending_reads_data});
@@ -1305,6 +1303,7 @@ pub fn CompactionType(
                 // OK, this needs to happen where the index block is incremented.
                 // FIXME: Not sure if I like this too much. According to release_table_blocks, it'll only release at the end of the bar, so should be ok?
                 // FIXME: It's critical to release blocks, so ensure this is done properly.
+                assert(beat.index_blocks_read == 0 or beat.index_blocks_read == 1);
                 if (beat.index_blocks_read == 1) {
                     for (blocks.source_index_blocks[1..2]) |*block|
                         compaction.release_table_blocks(block.block);
@@ -1317,7 +1316,7 @@ pub fn CompactionType(
             });
         }
 
-        fn check_and_finish_blocks(compaction: *Compaction, force_flush: bool, target_index_blocks: *Helpers.BlockPool, target_value_blocks: *Helpers.BlockPool) enum {
+        fn check_and_finish_blocks(compaction: *Compaction, force_flush: bool, target_index_blocks: *Helpers.BlockFIFO, target_value_blocks: *Helpers.BlockFIFO) enum {
             unfinished_value_block,
             finished_value_block,
         } {
@@ -1870,7 +1869,7 @@ pub fn compaction_op_min(op: u64) u64 {
 // test "value stream: foo" {
 //     const allocator = std.testing.allocator;
 //     var blocks: [32]BlockPtr = undefined;
-//     var stream = BlockPool.init(&blocks);
+//     var stream = BlockFIFO.init(&blocks);
 
 //     const block_to_write = try allocate_block(allocator);
 //     defer allocator.free(block_to_write);
