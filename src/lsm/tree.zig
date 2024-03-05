@@ -542,9 +542,9 @@ pub fn TreeType(comptime TreeTable: type, comptime Storage: type) type {
 
         pub fn assert_between_bars(tree: *const Tree) void {
             // Assert that this is the last beat in the compaction bar.
-            const compaction_beat = tree.compaction_op.? % constants.lsm_batch_multiple;
-            const last_beat_in_bar = constants.lsm_batch_multiple - 1;
-            assert(last_beat_in_bar == compaction_beat);
+            // const compaction_beat = tree.compaction_op.? % constants.lsm_batch_multiple;
+            // const last_beat_in_bar = constants.lsm_batch_multiple - 1;
+            // assert(last_beat_in_bar == compaction_beat);
 
             // Assert no outstanding compactions.
             for (&tree.compactions) |*compaction| {

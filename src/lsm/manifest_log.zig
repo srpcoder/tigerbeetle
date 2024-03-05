@@ -151,7 +151,7 @@ pub fn ManifestLogType(comptime Storage: type) type {
             });
 
             inline for (std.meta.fields(Pace)) |pace_field| {
-                log.debug("{?}: Manifest.Pace.{s} = {d}", .{
+                log.info("{?}: Manifest.Pace.{s} = {d}", .{
                     grid.superblock.replica_index,
                     pace_field.name,
                     @field(pace, pace_field.name),
@@ -389,7 +389,7 @@ pub fn ManifestLogType(comptime Storage: type) type {
                 }
             }
 
-            log.debug("{}: opened: checksum={} address={} entries={}", .{
+            log.info("{}: opened: checksum={} address={} entries={}", .{
                 manifest_log.superblock.replica_index.?,
                 block_checksum,
                 block_address,
@@ -429,7 +429,7 @@ pub fn ManifestLogType(comptime Storage: type) type {
             assert(manifest_log.blocks_closed == 0);
             assert(manifest_log.entry_count == 0);
 
-            log.debug("{}: open_done: opened block_count={} table_count={}", .{
+            log.info("{}: open_done: opened block_count={} table_count={}", .{
                 manifest_log.superblock.replica_index.?,
                 manifest_log.log_block_checksums.count,
                 manifest_log.table_extents.count(),
@@ -490,7 +490,7 @@ pub fn ManifestLogType(comptime Storage: type) type {
             assert(manifest_log.entry_count < schema.ManifestNode.entry_count_max);
             assert(manifest_log.blocks.count - manifest_log.blocks_closed == 1);
 
-            log.debug(
+            log.info(
                 "{}: {s}: level={} tree={} checksum={} address={} snapshot={}..{}",
                 .{
                     manifest_log.superblock.replica_index.?,
@@ -541,7 +541,7 @@ pub fn ManifestLogType(comptime Storage: type) type {
             assert(!manifest_log.writing);
             assert(manifest_log.write_callback == null);
 
-            log.debug("{}: flush: writing {} block(s)", .{
+            log.info("{}: flush: writing {} block(s)", .{
                 manifest_log.superblock.replica_index.?,
                 manifest_log.blocks_closed,
             });
@@ -599,7 +599,7 @@ pub fn ManifestLogType(comptime Storage: type) type {
                 assert(block_schema.entry_count == schema.ManifestNode.entry_count_max);
             }
 
-            log.debug("{}: write_block: checksum={} address={} entries={}", .{
+            log.info("{}: write_block: checksum={} address={} entries={}", .{
                 manifest_log.superblock.replica_index.?,
                 header.checksum,
                 header.address,
@@ -657,7 +657,7 @@ pub fn ManifestLogType(comptime Storage: type) type {
 
             // FIXME: Currently manifest compaction is hardcoded to run on the last beat of each bar.
             std.log.info("Manifest compaction running for op: {}", .{op});
-            assert((op + 1) % constants.lsm_batch_multiple == 0);
+            // assert(op % @divExact(constants.lsm_batch_multiple, 2) == 0);
 
             if (op < constants.lsm_batch_multiple or
                 manifest_log.superblock.working.vsr_state.op_compacted(op))
@@ -778,7 +778,7 @@ pub fn ManifestLogType(comptime Storage: type) type {
                 }
             }
 
-            log.debug("{}: compacted: checksum={} address={} free={}/{}", .{
+            log.info("{}: compacted: checksum={} address={} free={}/{}", .{
                 manifest_log.superblock.replica_index.?,
                 oldest_checksum,
                 oldest_address,
@@ -941,7 +941,7 @@ pub fn ManifestLogType(comptime Storage: type) type {
             manifest_log.log_block_checksums.push_assume_capacity(header.checksum);
             manifest_log.log_block_addresses.push_assume_capacity(header.address);
 
-            log.debug("{}: close_block: checksum={} address={} entries={}/{}", .{
+            log.info("{}: close_block: checksum={} address={} entries={}/{}", .{
                 manifest_log.superblock.replica_index.?,
                 header.checksum,
                 header.address,

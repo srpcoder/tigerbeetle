@@ -436,6 +436,7 @@ pub fn ManifestType(comptime Table: type, comptime Storage: type) type {
             for (&manifest.levels, 0..) |*manifest_level, index| {
                 const level: u8 = @intCast(index);
                 const table_count_visible_max = table_count_max_for_level(growth_factor, level);
+                std.log.info("Level: {}, visible: {}, table_count_visible_max: {}", .{ level, manifest_level.table_count_visible, table_count_visible_max });
                 assert(manifest_level.table_count_visible <= table_count_visible_max);
             }
         }

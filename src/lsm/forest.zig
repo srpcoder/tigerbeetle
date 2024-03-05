@@ -277,9 +277,9 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 const source_index_blocks = blocks[0..10];
 
                 const source_value_level_a = blocks[10..][0..10];
-                const source_value_level_b = blocks[20..][0..400];
+                const source_value_level_b = blocks[20..][0..10];
 
-                const target_value_blocks = blocks[420..][0..10];
+                const target_value_blocks = blocks[620..][0..10];
 
                 return .{
                     .source_index_blocks = source_index_blocks,
@@ -299,14 +299,19 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             ) void {
                 const compaction_beat = op % constants.lsm_batch_multiple;
                 const first_beat = compaction_beat == 0;
+                const half_beat = compaction_beat == @divExact(constants.lsm_batch_multiple, 2);
 
                 self.slot_filled_count = 0;
                 self.slot_running_count = 0;
 
-                if (first_beat) {
-                    self.bar_active = CompactionBitset.initEmpty();
+                if (first_beat or half_beat) {
+                    if (first_beat)
+                        self.bar_active = CompactionBitset.initEmpty();
 
                     for (self.compactions.slice(), 0..) |*compaction, i| {
+                        if (compaction.info.level_b % 2 == 0 and first_beat) continue;
+                        if (compaction.info.level_b % 2 != 0 and half_beat) continue;
+
                         // FIXME: It's very easy to mess up the ranges, and give overlapping blocks. To be able to assert
                         // that all our blocks are distinct would be great. Both here, and for the beat blocks set up
                         // by divide_blocks...
@@ -326,7 +331,8 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                             self.bar_active.set(i);
 
                             // ... and has its bar scoped buffers and budget assigned.
-                            compaction.bar_setup_budget(@divExact(constants.lsm_batch_multiple, 2), ring_buffer);
+                            // TODO: This is an _excellent_ value to fuzz on.
+                            compaction.bar_setup_budget(1, ring_buffer);
                         }
                     }
                 }
@@ -522,9 +528,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                             self.state = .full;
                         }
                     }
-                }
-
-                if (self.state == .draining) {
+                } else if (self.state == .draining) {
                     // We enter the draining state by blip_merge. Any concurrent writes would have
                     // a barrier along with it, but we need to worry about writing the blocks that
                     // this last blip_merge _just_ created.
@@ -760,40 +764,39 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             std.log.info("Entering forest.compact()", .{});
             const compaction_beat = op % constants.lsm_batch_multiple;
 
-            // Note: The first beat of the first bar is a special case. It has op 1, and so
-            // no bar_setup is called. bar_apply_to_manifest compensates for this internally currently.
             const first_beat = compaction_beat == 0;
+            const last_half_beat = compaction_beat == @divExact(constants.lsm_batch_multiple, 2) - 1;
+            const half_beat = compaction_beat == @divExact(constants.lsm_batch_multiple, 2);
             const last_beat = compaction_beat == constants.lsm_batch_multiple - 1;
 
             // Setup loop, runs only on the first beat of every bar, before any async work is done.
-            if (first_beat) {
+            if (first_beat or half_beat) {
                 log.info("===============================================================", .{});
-                log.info("Bar setup:", .{});
+                if (first_beat) {
+                    log.info("Bar setup:", .{});
+                    assert(forest.compaction_pipeline.compactions.count() == 0);
+                } else {
+                    log.info("HALF Bar setup:", .{});
+                }
                 log.info("===============================================================", .{});
-                assert(forest.compaction_pipeline.compactions.count() == 0);
 
                 // Iterate by levels first, then trees, as we expect similar levels to have similar
                 // time-of-death for writes. This helps internal SSD GC.
                 inline for (0..constants.lsm_levels) |level_b| {
                     inline for (tree_id_range.min..tree_id_range.max) |tree_id| {
                         var tree = tree_for_id(forest, tree_id);
-
-                        // FIXME: Big hack to limit to a single tree for debugging! This only
-                        // compacts the Account object tree and discards the rest.
-                        // if (tree_id != 3) {
-                        //     tree.table_immutable.mutability.immutable.flushed = true;
-                        // } else {
                         assert(tree.compactions.len == constants.lsm_levels);
 
                         var compaction = &tree.compactions[level_b];
 
                         // This will return how many compactions and stuff this level needs to do...
-                        if (compaction.bar_setup(tree, op)) |info| {
-                            // FIXME: Assert len?
-                            forest.compaction_pipeline.compactions.append_assume_capacity(CompactionInterface.init(info, compaction));
-                            log.info("Target Level: {}, Tree: {s}@{}: {}", .{ level_b, tree.config.name, op, info });
+                        if ((compaction.level_b % 2 != 0 and first_beat) or (compaction.level_b % 2 == 0 and half_beat)) {
+                            if (compaction.bar_setup(tree, op)) |info| {
+                                // FIXME: Assert len?
+                                forest.compaction_pipeline.compactions.append_assume_capacity(CompactionInterface.init(info, compaction));
+                                log.info("Target Level: {}, Tree: {s}@{}: {}", .{ level_b, tree.config.name, op, info });
+                            }
                         }
-                        // }
                     }
                 }
                 log.info("===============================================================", .{});
@@ -816,7 +819,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             // balances out, because we expect to naturally do less other compaction work on the
             // last beat.
             // The first bar has no manifest compaction.
-            if (last_beat and op > constants.lsm_batch_multiple) {
+            if ((last_beat or last_half_beat) and op > constants.lsm_batch_multiple) {
                 forest.manifest_log_progress = .compacting;
                 forest.manifest_log.compact(compact_manifest_log_callback, op);
                 forest.compaction_progress = .trees_and_manifest;
@@ -845,6 +848,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             const op = forest.progress.?.compact.op;
 
             const compaction_beat = op % constants.lsm_batch_multiple;
+            const last_half_beat = compaction_beat == @divExact(constants.lsm_batch_multiple, 2) - 1;
             const last_beat = compaction_beat == constants.lsm_batch_multiple - 1;
 
             // Forfeit any remaining grid reservations.
@@ -852,16 +856,12 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
             // Apply the changes to the manifest. This will run at the target compaction beat
             // that is requested.
-            inline for (0..constants.lsm_levels) |level_b| {
-                inline for (tree_id_range.min..tree_id_range.max) |tree_id| {
-                    // FIXME: make this last_beat dependent on what we want!
-                    if (last_beat) {
-                        var tree = tree_for_id(forest, tree_id);
-                        assert(tree.compactions.len == constants.lsm_levels);
+            if (last_beat or last_half_beat) {
+                for (forest.compaction_pipeline.compactions.slice()) |*compaction| {
+                    if (compaction.info.level_b % 2 == 0 and last_half_beat) continue;
+                    if (compaction.info.level_b % 2 != 0 and last_beat) continue;
 
-                        var compaction = &tree.compactions[level_b];
-                        if (compaction.bar != null) compaction.bar_apply_to_manifest();
-                    }
+                    compaction.bar_apply_to_manifest();
                 }
             }
 
@@ -891,7 +891,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             }
 
             // On the last beat of the bar, make sure that manifest log compaction is finished.
-            if (last_beat) {
+            if (last_beat or last_half_beat) {
                 switch (forest.manifest_log_progress) {
                     .idle => {},
                     .compacting => unreachable,

@@ -108,7 +108,11 @@ pub fn TableMemoryType(comptime Table: type) type {
             }
 
             pub fn remaining_in_memory(self: *const Iterator) usize {
-                return self.table_memory.count() - self.source_index;
+                return self.count() - self.source_index;
+            }
+
+            pub fn exhausted(self: *const Iterator) bool {
+                return self.count() == self.source_index;
             }
 
             pub fn copy(self: *Iterator, table_builder: *Table.Builder) void {
