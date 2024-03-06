@@ -590,11 +590,15 @@ pub const Header = extern struct {
                     if (self.request != 0) return "root: request != 0";
                 },
                 else => {
-                    if (self.client == 0) return "client == 0";
+                    // Client zero means the primary.
+                    maybe(self.client == 0);
+
                     if (self.op == 0) return "op == 0";
                     if (self.op <= self.commit) return "op <= commit";
                     if (self.timestamp == 0) return "timestamp == 0";
                     if (self.operation == .register) {
+                        if (self.request != 0) return "request != 0";
+                    } else if (self.client == 0) {
                         if (self.request != 0) return "request != 0";
                     } else {
                         if (self.request == 0) return "request == 0";
@@ -705,11 +709,15 @@ pub const Header = extern struct {
                     if (self.timestamp != 0) return "root: timestamp != 0";
                 },
                 else => {
-                    if (self.client == 0) return "client == 0";
+                    // Client zero means the primary.
+                    maybe(self.client == 0);
+
                     if (self.op == 0) return "op == 0";
                     if (self.op <= self.commit) return "op <= commit";
                     if (self.timestamp == 0) return "timestamp == 0";
                     if (self.operation == .register) {
+                        if (self.request != 0) return "request != 0";
+                    } else if (self.client == 0) {
                         if (self.request != 0) return "request != 0";
                     } else {
                         if (self.request == 0) return "request == 0";
