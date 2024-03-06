@@ -274,7 +274,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                     block.next = null;
                 }
 
-                const source_index_blocks = blocks[0..10];
+                const source_index_blocks = blocks[0..2];
 
                 const source_value_level_a = blocks[10..][0..10];
                 const source_value_level_b = blocks[20..][0..10];
