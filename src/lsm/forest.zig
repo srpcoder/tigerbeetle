@@ -198,6 +198,8 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             beat_active: CompactionBitset = CompactionBitset.initEmpty(),
             beat_reserved: CompactionBitset = CompactionBitset.initEmpty(),
 
+            // TODO: This whole interface around slot_filled_count / slot_running_count needs to be
+            // refactored.
             slots: [3]?PipelineSlot = .{ null, null, null },
             slot_filled_count: usize = 0,
             slot_running_count: usize = 0,
@@ -258,10 +260,8 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                     minimum_block_count *= 2;
 
                     // Lastly, reserve our source index blocks. For now, just require we have
-                    // enough for all tables and pretend like pipelining this isn't a thing.
-                    // FIXME: This shouldn't do that. The minimum is 2; but we don't really need
-                    // to hold on to index blocks if we read the value blocks directly. TBC.
-                    minimum_block_count += 9;
+                    // 2.
+                    minimum_block_count += 2;
 
                     break :blk minimum_block_count;
                 };
@@ -270,16 +270,16 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
                 assert(blocks.len >= minimum_block_count);
                 // FIXME: Giant hack since we reserve the upper space for bar scoped blocks!
-                for (blocks[0..700]) |*block| {
+                for (blocks[0..32]) |*block| {
                     block.next = null;
                 }
 
                 const source_index_blocks = blocks[0..2];
 
-                const source_value_level_a = blocks[10..][0..10];
-                const source_value_level_b = blocks[20..][0..10];
+                const source_value_level_a = blocks[2..][0..10];
+                const source_value_level_b = blocks[12..][0..10];
 
-                const target_value_blocks = blocks[620..][0..10];
+                const target_value_blocks = blocks[22..][0..10];
 
                 return .{
                     .source_index_blocks = source_index_blocks,
@@ -315,9 +315,8 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                         // FIXME: It's very easy to mess up the ranges, and give overlapping blocks. To be able to assert
                         // that all our blocks are distinct would be great. Both here, and for the beat blocks set up
                         // by divide_blocks...
-                        // I've already wasted enough time on a problem I knew about :D
-                        std.log.info("Index block range is: [{}..{}]", .{ 900 + i * 2, 900 + i * 2 + 2 });
-                        const blocks = self.compaction_blocks[900 + i * 2 .. 900 + i * 2 + 2];
+                        std.log.info("Index block range is: [{}..{}]", .{ 32 + i * 2, 32 + i * 2 + 2 });
+                        const blocks = self.compaction_blocks[32 + i * 2 .. 32 + i * 2 + 2];
                         const single_block = self.compaction_blocks[950 + i].block;
                         std.log.info("Immutable dummy block is: [{}]", .{950 + i});
 
@@ -349,7 +348,6 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 assert(self.callback == null);
                 assert(self.forest == null);
 
-                // FIXME: Actually, this should go off what's active rather, no?
                 for (self.compactions.slice(), 0..) |*compaction, i| {
                     if (!self.bar_active.isSet(i)) continue;
                     if (compaction.info.move_table) continue;
@@ -411,7 +409,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                     compaction_interface,
                 ).pipeline;
 
-                // FIXME: Better way of getting the slot.
+                // FIXME: Better way of getting the slot?
                 const slot = blk: for (0..3) |i| {
                     if (pipeline.slots[i]) |*slot| {
                         if (&slot.interface == compaction_interface) {
@@ -420,20 +418,14 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                     }
                 } else @panic("no matching slot");
 
-                // Currently only Merge is allowed to tell us we're exhausted.
+                // Currently only merge is allowed to tell us we're exhausted.
                 // TODO: In future, this will be extended to read, which might be able to, based
                 // on key ranges.
                 assert(maybe_exhausted == null or slot.active_operation == .merge);
 
                 if (maybe_exhausted) |exhausted| {
-                    if (exhausted.beat)
-                        log.info(
-                            "blip_callback: marking beat_active({}) to be unset...",
-                            .{slot.compaction_index},
-                        );
-
                     if (exhausted.beat) {
-                        log.info("YYYYYYYYYYYYYYY blip_callback: entering draining state...", .{});
+                        log.info("blip_callback: entering draining state...", .{});
                         pipeline.state = .draining;
                     }
 
@@ -448,19 +440,17 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                     }
                 }
 
-                // TODO: For now, we have a barrier on all stages... We might want to drop this, or
-                // have a more advanced barrier based on memory only.
                 pipeline.slot_running_count -= 1;
                 if (pipeline.slot_running_count > 0) {
                     return;
                 }
 
-                log.info("XXXXXXXXXXXXXXXX blip_callback: all slots joined - advancing pipeline", .{});
+                log.info("blip_callback: all slots joined - advancing pipeline", .{});
                 pipeline.advance_pipeline();
             }
 
             fn advance_pipeline(self: *CompactionPipeline) void {
-                log.info("ZZZZZZZZZ advance_pipeline", .{});
+                log.info("advance_pipeline", .{});
                 log.info("--------------------------------------------------------------------------------------------------------", .{});
                 const active_compaction_index = self.beat_active.findFirstSet() orelse {
                     log.info("advance_pipeline: All compactions finished! Calling beat_finished_next_tick().", .{});
@@ -483,13 +473,14 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                             .merge => {
                                 slot.active_operation = .write;
                                 self.slot_running_count += 1;
+                                log.info("Slot: {} Calling blip_write", .{i});
                                 slot.interface.blip_write(blip_callback);
                             },
                             .write => {
-                                log.info("... blip_callback: write done, starting read on {}.", .{i});
+                                log.info("advance_pipeline: write done, starting read on {}.", .{i});
                                 slot.active_operation = .read;
                                 self.slot_running_count += 1;
-                                log.info("Slot {}, Compaction {}: Calling blip_read", .{ i, active_compaction_index });
+                                log.info("Slot: {} Calling blip_read", .{i});
                                 slot.interface.blip_read(blip_callback);
                             },
                             .drained => unreachable,
@@ -551,7 +542,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                         }
                     }
                 } else if (self.state == .drained) {
-                    log.info("... ... blip_callback: write done on exhausted beat. Moving to next compaction in sequence.", .{});
+                    log.info("advance_pipeline: final blip_write finished.", .{});
 
                     // FIXME: Resetting these below variables like this sucks.
                     self.beat_active.unset(self.slots[0].?.compaction_index);
@@ -565,7 +556,6 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 }
 
                 // Now that IO has been dispatched, start CPU work if there was any.
-                // This has to happen right at the end, as CPU is sync so it will mess up the .stage enum.
                 if (cpu) |cpu_slot| {
                     const slot = &self.slots[cpu_slot].?;
 
@@ -907,8 +897,6 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
             const callback = progress.callback;
             forest.progress = null;
-
-            std.log.info("Ok finished compact_callback...", .{});
 
             callback(forest);
         }

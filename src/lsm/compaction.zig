@@ -121,6 +121,7 @@ pub fn CompactionHelperType(comptime Grid: type) type {
             free: Inner,
             pending: Inner,
             ready: Inner,
+            ioing: Inner,
 
             count: usize,
 
@@ -140,6 +141,7 @@ pub fn CompactionHelperType(comptime Grid: type) type {
                     .free = free,
                     .pending = .{ .name = "pending" },
                     .ready = .{ .name = "ready" },
+                    .ioing = .{ .name = "ioing" },
                     .count = blocks.len,
                 };
             }
@@ -158,8 +160,22 @@ pub fn CompactionHelperType(comptime Grid: type) type {
                 return value;
             }
 
+            pub fn ready_to_ioing(self: *BlockFIFO) ?*CompactionBlock {
+                const value = self.ready.pop() orelse return null;
+                self.ioing.push(value);
+
+                return value;
+            }
+
             pub fn ready_to_free(self: *BlockFIFO) ?*CompactionBlock {
                 const value = self.ready.pop() orelse return null;
+                self.free.push(value);
+
+                return value;
+            }
+
+            pub fn ioing_to_free(self: *BlockFIFO) ?*CompactionBlock {
+                const value = self.ioing.pop() orelse return null;
                 self.free.push(value);
 
                 return value;
@@ -1185,6 +1201,7 @@ pub fn CompactionType(
                 const source_b_exhausted = blk: {
                     if (bar.range_b.tables.empty()) break :blk true;
 
+                    std.log.info("bar.source_b_position.index_block = {}, bar.range_b.tables.count() = {}", .{ bar.source_b_position.index_block, bar.range_b.tables.count() });
                     break :blk bar.source_b_position.index_block == bar.range_b.tables.count();
                 };
 
@@ -1194,8 +1211,10 @@ pub fn CompactionType(
                 blk: {
                     if (source_b_exhausted) break :blk;
 
-                    const block = blocks.source_value_blocks[1].ready.peek().?.block;
-                    const value_count = Table.data_block_values_used(block).len;
+                    const current_value_block = blocks.source_value_blocks[1].ready.peek().?.block;
+                    const value_count = Table.data_block_values_used(current_value_block).len;
+
+                    std.log.info("Current VBI is: {} value_count is: {}", .{ bar.source_b_position.value_block_index, value_count });
 
                     if (bar.source_b_position.value_block_index == value_count) {
                         bar.source_b_position.value_block_index = 0;
@@ -1206,14 +1225,22 @@ pub fn CompactionType(
 
                         const value_blocks_used = index_schema.data_blocks_used(index_block);
 
-                        if (bar.source_b_position.value_block == value_blocks_used)
+                        if (bar.source_b_position.value_block == value_blocks_used) {
+                            bar.source_b_position.value_block = 0;
                             bar.source_b_position.index_block += 1;
+
+                            // FIXME: Perhaps this logic should be in read rather?
+                            if (bar.source_b_position.index_block < bar.range_b.tables.count()) {
+                                beat.index_read_done = false;
+                                beat.index_blocks_read_b = 0;
+                            }
+                        }
 
                         if (blocks.source_value_blocks[1].ready.count > 0)
                             _ = blocks.source_value_blocks[1].ready_to_free();
-                    }
 
-                    // _ = value_blocks_used;
+                        std.log.info("Updated source_b_position to: [{}][{}][{}]", .{ bar.source_b_position.index_block, bar.source_b_position.value_block, bar.source_b_position.value_block_index });
+                    }
                 }
 
                 // Check if we have blocks available in memory, bail out if not.
@@ -1462,6 +1489,7 @@ pub fn CompactionType(
 
                 assert(target_index_blocks.pending.count == 1);
                 _ = target_index_blocks.pending_to_ready().?;
+                std.log.info("WTFFF: {}", .{target_index_blocks.ready.count});
 
                 // Make this table visible at the end of this bar.
                 bar.manifest_entries.append_assume_capacity(.{
@@ -1507,8 +1535,7 @@ pub fn CompactionType(
             assert(write.pending_writes == 0);
 
             // Write any complete index blocks.
-            var maybe_target_index_block = bar.target_index_blocks.?.ready.peek();
-            while (maybe_target_index_block) |target_index_block| : (maybe_target_index_block = target_index_block.next) {
+            while (bar.target_index_blocks.?.ready_to_ioing()) |target_index_block| {
                 log.info("blip_write({s}): Issuing an index write for 0x{x} ", .{ compaction.tree_config.name, @intFromPtr(target_index_block.block) });
 
                 target_index_block.target = compaction;
@@ -1517,8 +1544,7 @@ pub fn CompactionType(
             }
 
             // Write any complete value blocks.
-            var maybe_target_value_block = beat.blocks.?.target_value_blocks.ready.peek();
-            while (maybe_target_value_block) |target_value_block| : (maybe_target_value_block = target_value_block.next) {
+            while (beat.blocks.?.target_value_blocks.ready_to_ioing()) |target_value_block| {
                 log.info("blip_write({s}): Issuing a value write for 0x{x}", .{ compaction.tree_config.name, @intFromPtr(target_value_block.block) });
 
                 target_value_block.target = compaction;
@@ -1546,8 +1572,8 @@ pub fn CompactionType(
 
             const beat = &compaction.beat.?;
 
-            // const duration = beat.write.?.timer.read();
-            // std.log.info("Write complete for a block - timer at {}", .{std.fmt.fmtDuration(duration)});
+            const duration = beat.write.?.timer.read();
+            std.log.info("Write complete for a block - timer at {}", .{std.fmt.fmtDuration(duration)});
 
             assert(beat.write != null);
             const write = &beat.write.?;
@@ -1556,8 +1582,8 @@ pub fn CompactionType(
             // Join on all outstanding writes before continuing.
             if (write.pending_writes != 0) return;
 
-            while (beat.blocks.?.target_value_blocks.ready_to_free() != null) {}
-            while (compaction.bar.?.target_index_blocks.?.ready_to_free() != null) {}
+            while (beat.blocks.?.target_value_blocks.ioing_to_free() != null) {}
+            while (compaction.bar.?.target_index_blocks.?.ioing_to_free() != null) {}
 
             // Call the next tick handler directly. This callback is invoked async, so it's safe
             // from stack overflows.
@@ -1739,7 +1765,7 @@ pub fn CompactionType(
             };
 
             const values_out = bar.table_builder.data_block_values();
-            var values_in_a_index: usize = 0;
+            var values_in_a_index: usize = bar.source_a_position.value_block_index;
 
             var values_out_index = bar.table_builder.value_count;
 
@@ -1777,6 +1803,8 @@ pub fn CompactionType(
             const bar = &compaction.bar.?;
             const beat = &compaction.beat.?;
 
+            std.log.info("Entering merge_values...", .{});
+
             // assert(compaction.values_in[0].len > 0);
             // assert(compaction.values_in[1].len > 0);
             assert(bar.table_builder.value_count < Table.layout.block_value_count_max);
@@ -1786,18 +1814,20 @@ pub fn CompactionType(
                 break :blk bar.source_a_immutable_values.?;
             } else blk: {
                 const block = beat.blocks.?.source_value_blocks[0].ready.peek().?.block;
-                var values = Table.data_block_values_used(block);
-                break :blk values[bar.source_a_position.value_block_index..];
+                break :blk Table.data_block_values_used(block);
             };
             const source_b_local = blk: {
                 const block = beat.blocks.?.source_value_blocks[1].ready.peek().?.block;
-                break :blk Table.data_block_values_used(block)[bar.source_b_position.value_block_index..];
+                break :blk Table.data_block_values_used(block);
             };
 
             const values_out = bar.table_builder.data_block_values();
-            var source_a_index: usize = 0;
-            var source_b_index: usize = 0;
+            var source_a_index: usize = bar.source_a_position.value_block_index;
+            var source_b_index: usize = bar.source_b_position.value_block_index;
             var values_out_index = bar.table_builder.value_count;
+
+            assert(source_a_index < source_a_local.len);
+            assert(source_b_index < source_b_local.len);
 
             // Merge as many values as possible.
             while (source_a_index < source_a_local.len and
@@ -1850,6 +1880,8 @@ pub fn CompactionType(
                 bar.source_a_position.value_block_index = source_a_index;
             }
             bar.source_b_position.value_block_index = source_b_index;
+            std.log.info("Leaving MV, updated sbi to {} - len is {}", .{ source_b_index, source_b_local.len });
+
             bar.table_builder.value_count = values_out_index;
         }
     };
