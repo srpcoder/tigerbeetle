@@ -438,6 +438,10 @@ pub fn ReplicaType(
         /// (syncing≠idle)
         sync_message_timeout: Timeout,
 
+        /// The number of ticks on an idle cluester before injecting a `pulse` operation.
+        /// (status=normal and primary)
+        pulse_timeout: Timeout,
+
         /// Used to calculate exponential backoff with random jitter.
         /// Seeded with the replica's index number.
         prng: std.rand.DefaultPrng,
@@ -1042,6 +1046,11 @@ pub fn ReplicaType(
                     .id = replica_index,
                     .after = 50,
                 },
+                .pulse_timeout = Timeout{
+                    .name = "pulse_timeout",
+                    .id = replica_index,
+                    .after = 1 * (std.time.ms_per_s / constants.tick_ms), // 1s
+                },
                 .prng = std.rand.DefaultPrng.init(replica_index),
 
                 .aof = options.aof,
@@ -1128,6 +1137,7 @@ pub fn ReplicaType(
             self.repair_sync_timeout.tick();
             self.grid_repair_message_timeout.tick();
             self.sync_message_timeout.tick();
+            self.pulse_timeout.tick();
 
             if (self.ping_timeout.fired()) self.on_ping_timeout();
             if (self.prepare_timeout.fired()) self.on_prepare_timeout();
@@ -1143,6 +1153,7 @@ pub fn ReplicaType(
             if (self.repair_sync_timeout.fired()) self.on_repair_sync_timeout();
             if (self.grid_repair_message_timeout.fired()) self.on_grid_repair_message_timeout();
             if (self.sync_message_timeout.fired()) self.on_sync_message_timeout();
+            if (self.pulse_timeout.fired()) self.on_pulse_timeout();
 
             // None of the on_timeout() functions above should send a message to this replica.
             assert(self.loopback_queue == null);
@@ -2866,6 +2877,29 @@ pub fn ReplicaType(
                 => return,
 
                 .requesting_checkpoint => self.send_request_sync_checkpoint(),
+            }
+        }
+
+        fn on_pulse_timeout(self: *Self) void {
+            assert(self.status == .normal);
+            assert(self.primary());
+            assert(self.pulse_timeout.ticking);
+
+            if (self.pipeline.queue.prepare_queue.full()) {
+                self.pulse_timeout.backoff(self.prng.random());
+                return;
+            }
+
+            const realtime = self.clock.realtime();
+            self.state_machine.prepare_timestamp = @max(
+                self.state_machine.prepare_timestamp,
+                @as(u64, @intCast(realtime)),
+            );
+
+            if (self.state_machine.pulse_operation()) |pulse| {
+                self.pulse_inject(pulse);
+            } else {
+                self.pulse_timeout.reset();
             }
         }
 
@@ -5180,7 +5214,7 @@ pub fn ReplicaType(
                     // Note that `prepare` must be called before so the StateMachine can
                     // correctly assure that time-dependant tasks (e.g. expiring transfers)
                     // will never intersect with a request batch.
-                    if (self.state_machine.pulse_operation(operation)) |pulse_operation| {
+                    if (self.state_machine.pulse_operation()) |pulse_operation| {
                         self.pulse_inject(pulse_operation);
                         self.pipeline.queue.delay_request(request);
                         return;
@@ -5244,6 +5278,9 @@ pub fn ReplicaType(
                 self.prepare_timeout.start();
                 self.primary_abdicate_timeout.start();
             }
+            assert(self.pulse_timeout.ticking);
+            self.pulse_timeout.reset();
+
             self.pipeline.queue.push_prepare(message);
             self.on_prepare(message);
 
@@ -7324,6 +7361,7 @@ pub fn ReplicaType(
             self.repair_timeout.stop();
             self.repair_sync_timeout.stop();
             self.grid_repair_message_timeout.start();
+            self.pulse_timeout.stop();
 
             if (self.pipeline == .queue) {
                 // Convert the pipeline queue into a cache.
@@ -7372,12 +7410,14 @@ pub fn ReplicaType(
                 assert(!self.do_view_change_message_timeout.ticking);
                 assert(!self.request_start_view_message_timeout.ticking);
                 assert(!self.repair_sync_timeout.ticking);
+                assert(!self.pulse_timeout.ticking);
 
                 self.ping_timeout.start();
                 self.start_view_change_message_timeout.start();
                 self.commit_message_timeout.start();
                 self.repair_timeout.start();
                 self.grid_repair_message_timeout.start();
+                self.pulse_timeout.start();
 
                 self.pipeline.cache.deinit(self.message_bus.pool);
                 self.pipeline = .{ .queue = .{} };
@@ -7399,6 +7439,7 @@ pub fn ReplicaType(
                 assert(!self.do_view_change_message_timeout.ticking);
                 assert(!self.request_start_view_message_timeout.ticking);
                 assert(!self.repair_sync_timeout.ticking);
+                assert(!self.pulse_timeout.ticking);
 
                 self.ping_timeout.start();
                 self.normal_heartbeat_timeout.start();
@@ -7450,6 +7491,7 @@ pub fn ReplicaType(
             assert(!self.do_view_change_message_timeout.ticking);
             assert(!self.request_start_view_message_timeout.ticking);
             assert(!self.repair_sync_timeout.ticking);
+            assert(!self.pulse_timeout.ticking);
 
             self.ping_timeout.start();
             self.normal_heartbeat_timeout.start();
@@ -7481,6 +7523,7 @@ pub fn ReplicaType(
                 assert(!self.normal_heartbeat_timeout.ticking);
                 assert(!self.primary_abdicate_timeout.ticking);
                 assert(!self.repair_sync_timeout.ticking);
+                assert(!self.pulse_timeout.ticking);
                 assert(!self.pipeline_repairing);
                 assert(self.pipeline == .queue);
                 assert(self.view == view_new);
@@ -7502,6 +7545,7 @@ pub fn ReplicaType(
                 self.request_start_view_message_timeout.stop();
                 self.repair_timeout.start();
                 self.grid_repair_message_timeout.start();
+                self.pulse_timeout.start();
 
                 // Do not reset the pipeline as there may be uncommitted ops to drive to completion.
                 if (self.pipeline.queue.prepare_queue.count > 0) {
@@ -7624,6 +7668,7 @@ pub fn ReplicaType(
             self.repair_sync_timeout.stop();
             self.prepare_timeout.stop();
             self.primary_abdicate_timeout.stop();
+            self.pulse_timeout.stop();
             self.grid_repair_message_timeout.start();
 
             if (self.primary_index(self.view) == self.replica) {
