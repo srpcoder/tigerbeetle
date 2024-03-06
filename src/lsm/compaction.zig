@@ -355,8 +355,8 @@ pub fn CompactionType(
             /// * It uses an iterator interface, as opposed to raw blocks like the rest.
             /// * It is responsible for keeping track of its own position, across beats.
             /// * It encompasses all possible values, so we don't need to worry about reading more.
-            source_a_block: ?BlockPtr,
-            source_a_immutable_values: ?[]Value = null,
+            source_a_immutable_block: ?BlockPtr = null,
+            source_a_immutable_values: ?[]const Value = null,
             source_a_position: Position = .{},
 
             /// level_b always comes from disk.
@@ -898,19 +898,21 @@ pub fn CompactionType(
             // TODO: We only support 2 index blocks and don't support spanning them at the moment :/
             assert(blocks.source_index_blocks.len == 2);
 
-            const table_ref = bar.range_b.tables.get(bar.source_b_position.index_block);
-            blocks.source_index_blocks[read_target].target = compaction;
-            std.log.info("Reading index block {} - checksum {}", .{ bar.source_b_position.index_block, table_ref.table_info.checksum });
-            compaction.grid.read_block(
-                .{ .from_local_or_global_storage = blip_read_index_callback },
-                &blocks.source_index_blocks[read_target].read,
-                table_ref.table_info.address,
-                table_ref.table_info.checksum,
-                .{ .cache_read = true, .cache_write = true },
-            );
-            read.pending_reads_index += 1;
-            beat.index_blocks_read_b += 1;
-            read_target += 1;
+            if (bar.range_b.tables.count() > 0) {
+                const table_ref = bar.range_b.tables.get(bar.source_b_position.index_block);
+                blocks.source_index_blocks[read_target].target = compaction;
+                std.log.info("Reading index block {} - checksum {}", .{ bar.source_b_position.index_block, table_ref.table_info.checksum });
+                compaction.grid.read_block(
+                    .{ .from_local_or_global_storage = blip_read_index_callback },
+                    &blocks.source_index_blocks[read_target].read,
+                    table_ref.table_info.address,
+                    table_ref.table_info.checksum,
+                    .{ .cache_read = true, .cache_write = true },
+                );
+                read.pending_reads_index += 1;
+                beat.index_blocks_read_b += 1;
+                read_target += 1;
+            }
 
             log.info("blip_read(): Scheduled {} index reads", .{
                 read.pending_reads_index,
@@ -1010,7 +1012,7 @@ pub fn CompactionType(
 
             // Read data for our tables in range b, which will always come from disk.
             const table_b_count = bar.range_b.tables.count();
-            assert(table_b_count > 0 and beat.index_blocks_read_b == 1);
+            assert(table_b_count == 0 or beat.index_blocks_read_b == 1);
 
             if (table_b_count > 0) {
                 assert(beat.blocks.?.source_value_blocks[1].pending.empty());
@@ -1147,8 +1149,6 @@ pub fn CompactionType(
             // FIXME: NB!! We need to take in account the values _not_ remaining in memory too. Ie, we need to blip
             // if we still have values but we've exhausted in memory values!! We hack this by making read blip memory huge lol
             while (true) {
-                log.info("blip_merge(): remaining_in_memory: values_a={} values_b={}", .{ source_a_remaining, source_b_remaining });
-
                 // Set the index block if needed.
                 if (bar.table_builder.state == .no_blocks) {
                     if (target_index_blocks.ready.count == @divExact(target_index_blocks.count, 2)) break;
@@ -1168,13 +1168,62 @@ pub fn CompactionType(
                 }
 
                 // Refill immutable values, if needed.
-                const source_a_exhausted = false;
-                compaction.fill_immutable_block();
+                const source_a_exhausted = if (bar.table_info_a == .immutable) blk: {
+                    compaction.fill_immutable_block();
+                    break :blk bar.source_a_immutable_values.?.len == 0;
+                } else blk: {
+                    assert(false); // No disk for level a yhet
+                    const index_block = blocks.source_index_blocks[0].block;
+                    const index_schema = schema.TableIndex.from(index_block);
 
-                const source_b_exhausted = false;
+                    const value_blocks_used = index_schema.data_blocks_used(index_block);
+
+                    break :blk bar.source_a_position.value_block == value_blocks_used and
+                        bar.source_a_position.value_block_index == 1234; // FIXME
+                };
+
+                const source_b_exhausted = blk: {
+                    if (bar.range_b.tables.empty()) break :blk true;
+
+                    break :blk bar.source_b_position.index_block == bar.range_b.tables.count();
+                };
+
+                std.log.info("blip_merge({s}): source_a_exhausted={} source_b_exhausted={}.", .{ compaction.tree_config.name, source_a_exhausted, source_b_exhausted });
+
+                // Increment our state - level b
+                blk: {
+                    if (source_b_exhausted) break :blk;
+
+                    const block = blocks.source_value_blocks[1].ready.peek().?.block;
+                    const value_count = Table.data_block_values_used(block).len;
+
+                    if (bar.source_b_position.value_block_index == value_count) {
+                        bar.source_b_position.value_block_index = 0;
+                        bar.source_b_position.value_block += 1;
+
+                        const index_block = blocks.source_index_blocks[1].block;
+                        const index_schema = schema.TableIndex.from(index_block);
+
+                        const value_blocks_used = index_schema.data_blocks_used(index_block);
+
+                        if (bar.source_b_position.value_block == value_blocks_used)
+                            bar.source_b_position.index_block += 1;
+
+                        if (blocks.source_value_blocks[1].ready.count > 0)
+                            _ = blocks.source_value_blocks[1].ready_to_free();
+                    }
+
+                    // _ = value_blocks_used;
+                }
 
                 // Check if we have blocks available in memory, bail out if not.
-                if (false) {
+                if (bar.table_info_a == .disk and !source_a_exhausted and blocks.source_value_blocks[0].ready.count == 0) {
+                    std.log.info("blip_merge({s}): need to read more blocks for source_a.", .{compaction.tree_config.name});
+                    break;
+                }
+
+                if (!source_b_exhausted and blocks.source_value_blocks[1].ready.count == 0) {
+                    std.log.info("blip_merge({s}): need to read more blocks for source_b.", .{compaction.tree_config.name});
                     break;
                 }
 
@@ -1182,26 +1231,26 @@ pub fn CompactionType(
                 // apply when a source is _completely_ exhausted; ie, there's no more data on disk
                 // so the mode is switched. This _is not_ an optimization depending on what's in
                 // memory.
-                if (source_a_exhausted == 0) {
+                if (source_a_exhausted and !source_b_exhausted) {
                     compaction.copy(.b);
-                } else if (source_b_exhausted) {
+                } else if (source_b_exhausted and !source_a_exhausted) {
                     if (bar.drop_tombstones) {
                         compaction.copy_drop_tombstones();
                     } else {
                         compaction.copy(.a);
                     }
-                } else {
+                } else if (!source_a_exhausted and !source_b_exhausted) {
                     compaction.merge_values();
                 }
 
-                const source_values_processed = (source_a_remaining - source_a.remaining_in_memory()) + (source_b_remaining - source_b.remaining_in_memory());
-                assert(source_values_processed > 0);
+                // const source_values_processed = (source_a_remaining - source_a.remaining_in_memory()) + (source_b_remaining - source_b.remaining_in_memory());
+                // assert(source_values_processed > 0);
 
-                beat.source_values_processed += source_values_processed;
-                bar.source_values_processed += source_values_processed;
+                // beat.source_values_processed += source_values_processed;
+                // bar.source_values_processed += source_values_processed;
 
-                source_a_remaining = source_a.remaining_in_memory();
-                source_b_remaining = source_b.remaining_in_memory();
+                // source_a_remaining = source_a.remaining_in_memory();
+                // source_b_remaining = source_b.remaining_in_memory();
 
                 // When checking if we're done, there are two things we need to consider:
                 // 1. Have we finished our input entirely? If so, we flush what we have - it's
@@ -1211,8 +1260,8 @@ pub fn CompactionType(
                 //
                 // This means that we'll potentially overrun our per_beat_input_goal by up to
                 // a full value block.
-                source_exhausted_bar = bar.source_values_processed == bar.compaction_tables_value_count;
-                source_exhausted_beat = beat.source_values_processed >= bar.per_beat_input_goal;
+                source_exhausted_bar = source_a_exhausted and source_b_exhausted; //bar.source_values_processed == bar.compaction_tables_value_count;
+                source_exhausted_beat = source_exhausted_bar; //beat.source_values_processed >= bar.per_beat_input_goal;
 
                 log.info("blip_merge(): beat.source_values_processed: {}, goal {}. (source_exhausted_bar: {}, source_exhausted_beat: {}) (bar.source_values_processed: {}, bar.compaction_tables_value_count: {})", .{
                     beat.source_values_processed,
@@ -1229,7 +1278,7 @@ pub fn CompactionType(
                 }
             }
 
-            std.log.info("source_b.remaining_in_memory: {} -- source_b.exhausted(): {}", .{ source_b.remaining_in_memory(), source_b.exhausted() });
+            // std.log.info("source_b.remaining_in_memory: {} -- source_b.exhausted(): {}", .{ source_b.remaining_in_memory(), source_b.exhausted() });
 
             // assert(source_a.remaining_in_memory() > 0 or source_a.exhausted());
             // assert(source_b.remaining_in_memory() > 0 or source_b.exhausted());
@@ -1242,10 +1291,10 @@ pub fn CompactionType(
             log.info("blip_merge(): Took {} to CPU merge blocks", .{std.fmt.fmtDuration(d)});
 
             if (source_exhausted_bar) {
-                assert(source_a.remaining_in_memory() == 0 and source_a.exhausted());
-                assert(source_b.remaining_in_memory() == 0 and source_b.exhausted());
+                // assert(source_a.remaining_in_memory() == 0 and source_a.exhausted());
+                // assert(source_b.remaining_in_memory() == 0 and source_b.exhausted());
 
-                if (bar.source_a == .disk)
+                if (bar.table_info_a == .disk)
                     compaction.release_table_blocks(blocks.source_index_blocks[0].block);
 
                 // FIXME: Do this where we increment the table block...
@@ -1260,25 +1309,25 @@ pub fn CompactionType(
         }
 
         // FIXME: Collapse this into fill_immutable_values.
-        fn fill_immutable_block(compaction: *Compaction) enum { remaining, exhausted } {
+        fn fill_immutable_block(compaction: *Compaction) void {
             const bar = &compaction.bar.?;
 
             assert(bar.table_info_a == .immutable);
-            assert(bar.source_a_block != null);
+            assert(bar.source_a_immutable_block != null);
             stdx.maybe(bar.source_a_immutable_values == null);
             assert(compaction.level_b == 0);
 
             // If our immutable values 'block' is empty, refill it from its iterator.
             if (bar.source_a_immutable_values == null or bar.source_a_immutable_values.?.len == 0) {
-                bar.source_a_immutable_values = Table.data_block_values(bar.source_a_block.?);
-                const filled = compaction.fill_immutable_values(bar.source_a_immutable_values.?);
-                bar.source_a_immutable_values = bar.source_a_immutable_values[0..filled];
-
-                if (filled == 0) return .exhausted;
+                const values = Table.data_block_values(bar.source_a_immutable_block.?);
+                if (bar.table_info_a.immutable.len > 0) {
+                    const filled = compaction.fill_immutable_values(values);
+                    bar.source_a_immutable_values = values[0..filled];
+                    std.log.info("refilled immutable with {} values.", .{filled});
+                } else {
+                    std.log.info("immutable is exhaustfed!.", .{});
+                }
             }
-
-            // If we're not empty, we have values remaining.
-            return .remaining;
         }
 
         /// Copies values to `target` from our immutable table input. In the process, merge values
@@ -1564,10 +1613,11 @@ pub fn CompactionType(
             });
 
             // Assert our input has been fully exhausted.
-            assert(bar.source_values_processed == bar.compaction_tables_value_count);
+            // FIXME
+            // assert(bar.source_values_processed == bar.compaction_tables_value_count);
 
             // Mark the immutable table as flushed, if we were compacting into level 0.
-            if (compaction.level_b == 0 and bar.source_a_immutable_iterator.?.exhausted())
+            if (compaction.level_b == 0 and bar.table_info_a.immutable.len == 0)
                 bar.tree.table_immutable.mutability.immutable.flushed = true;
 
             // Each compaction's manifest updates are deferred to the end of the last
@@ -1625,148 +1675,182 @@ pub fn CompactionType(
         // and could handle both what copy_drop_tombstones() and Iterator.copy() do, but we expect
         // copy() -> copy_drop_tombstones() -> merge_values() in terms of performance.
         fn copy(compaction: *Compaction, comptime source: enum { a, b }) void {
-            _ = source;
-            _ = compaction;
-            // const bar = &compaction.bar.?;
+            const bar = &compaction.bar.?;
+            const beat = &compaction.beat.?;
 
-            // log.info("blip_merge({s}): Merging via copy({s})", .{ compaction.tree_config.name, @tagName(source) });
-            // switch (source) {
-            //     .a => assert(bar.source_b.remaining_in_memory() == 0),
-            //     .b => assert(bar.source_a.remaining_in_memory() == 0),
-            // }
-            // assert(bar.table_builder.value_count < Table.layout.block_value_count_max);
+            assert(bar.table_builder.value_count < Table.layout.block_value_count_max);
 
-            // // Copy variables locally to ensure a tight loop.
-            // // TODO: Actually benchmark this.
-            // var source_local = if (source == .a) bar.source_a else bar.source_b;
+            log.info("blip_merge({s}): Merging via copy({s})", .{ compaction.tree_config.name, @tagName(source) });
 
-            // const values_out = bar.table_builder.data_block_values();
-            // var values_out_index = bar.table_builder.value_count;
+            // Copy variables locally to ensure a tight loop.
+            // TODO: Actually benchmark this.
+            const source_local = if (source == .a) blk: {
+                if (bar.table_info_a == .immutable) {
+                    break :blk bar.source_a_immutable_values.?;
+                } else {
+                    const block = beat.blocks.?.source_value_blocks[0].ready.peek().?.block;
+                    break :blk Table.data_block_values_used(block)[bar.source_a_position.value_block_index..];
+                }
+            } else blk: {
+                const block = beat.blocks.?.source_value_blocks[1].ready.peek().?.block;
+                break :blk Table.data_block_values_used(block)[bar.source_b_position.value_block_index..];
+            };
 
-            // // Merge as many values as possible.
-            // while (source_local.next()) |value| {
-            //     // std.log.info("Val c: {} - is tombstone: {} - kfv: {}", .{ value, tombstone(&value), key_from_value(&value) });
-            //     values_out[values_out_index] = value;
-            //     values_out_index += 1;
-            //     if (values_out_index == values_out.len) break;
-            // }
+            const values_out = bar.table_builder.data_block_values();
+            var values_out_index = bar.table_builder.value_count;
 
-            // // Copy variables back out.
-            // if (source == .a)
-            //     bar.source_a = source_local
-            // else
-            //     bar.source_b = source_local;
-            // bar.table_builder.value_count = values_out_index;
+            assert(source_local.len > 0);
+
+            const len = @min(source_local.len, values_out.len - values_out_index);
+            assert(len > 0);
+            stdx.copy_disjoint(
+                .exact,
+                Value,
+                values_out[values_out_index..][0..len],
+                source_local[0..len],
+            );
+
+            if (source == .a) {
+                bar.source_a_position.value_block_index += len;
+            } else {
+                bar.source_b_position.value_block_index += len;
+            }
+
+            bar.table_builder.value_count += @as(u32, @intCast(len));
         }
 
         /// Copy values from table_a to table_b, dropping tombstones as we go.
         fn copy_drop_tombstones(compaction: *Compaction) void {
-            _ = compaction;
-            // const bar = &compaction.bar.?;
+            const bar = &compaction.bar.?;
+            const beat = &compaction.beat.?;
 
-            // log.info("blip_merge({s}: Merging via copy_drop_tombstones()", .{compaction.tree_config.name});
+            log.info("blip_merge({s}: Merging via copy_drop_tombstones()", .{compaction.tree_config.name});
             // assert(bar.source_b.remaining_in_memory() == 0);
-            // assert(bar.table_builder.value_count < Table.layout.block_value_count_max);
+            assert(bar.table_builder.value_count < Table.layout.block_value_count_max);
 
-            // // Copy variables locally to ensure a tight loop.
-            // // TODO: Actually benchmark this.
-            // var source_a_local = bar.source_a;
-            // const values_out = bar.table_builder.data_block_values();
-            // var values_out_index = bar.table_builder.value_count;
+            // Copy variables locally to ensure a tight loop.
+            // TODO: Actually benchmark this.
+            const source_a_local: []const Value = if (bar.table_info_a == .immutable) blk: {
+                break :blk bar.source_a_immutable_values.?;
+            } else blk: {
+                const block = beat.blocks.?.source_value_blocks[0].ready.peek().?.block;
+                var values = Table.data_block_values_used(block);
+                break :blk values[bar.source_a_position.value_block_index..];
+            };
 
-            // // Merge as many values as possible.
-            // while (source_a_local.next()) |value_a| {
-            //     if (tombstone(&value_a)) {
-            //         // TODO: What's the impact of this check? We could invert it since Table.usage
-            //         // is comptime known.
-            //         // std.log.info("Val cdt in TS check: {} - is tombstone: {} - kfv: {}", .{ value_a, tombstone(&value_a), key_from_value(&value_a) });
-            //         // assert(Table.usage != .secondary_index);
-            //         continue;
-            //     }
-            //     values_out[values_out_index] = value_a;
-            //     values_out_index += 1;
+            const values_out = bar.table_builder.data_block_values();
+            var values_in_a_index: usize = 0;
 
-            //     if (values_out_index == values_out.len) break;
-            // }
+            var values_out_index = bar.table_builder.value_count;
 
-            // // Copy variables back out.
-            // bar.source_a = source_a_local;
-            // bar.table_builder.value_count = values_out_index;
+            // Merge as many values as possible.
+            while (values_in_a_index < source_a_local.len and
+                values_out_index < values_out.len)
+            {
+                const value_a = &source_a_local[values_in_a_index];
+
+                values_in_a_index += 1;
+                // TODO: What's the impact of this check? We could invert it since Table.usage
+                // is comptime known.
+                if (tombstone(value_a)) {
+                    assert(Table.usage != .secondary_index);
+                    continue;
+                }
+                values_out[values_out_index] = value_a.*;
+                values_out_index += 1;
+            }
+
+            // Copy variables back out.
+            if (bar.table_info_a == .immutable) {
+                bar.source_a_immutable_values = source_a_local[values_in_a_index..];
+            } else {
+                bar.source_a_position.value_block_index = values_in_a_index;
+            }
+            bar.table_builder.value_count = values_out_index;
+
+            std.log.info("At end of copy_drop_tombstones count is : {}", .{bar.source_a_immutable_values.?.len});
         }
 
         /// Merge values from table_a and table_b, with table_a taking precedence. Tombstones may
         /// or may not be dropped depending on bar.drop_tombstones.
         fn merge_values(compaction: *Compaction) void {
-            _ = compaction;
-            // const bar = &compaction.bar.?;
-            // const drop_tombstones = bar.drop_tombstones;
+            const bar = &compaction.bar.?;
+            const beat = &compaction.beat.?;
 
-            // log.info("blip_merge({s}): Merging via merge_values()", .{compaction.tree_config.name});
-            // assert(bar.source_a.remaining_in_memory() > 0);
-            // assert(bar.source_b.remaining_in_memory() > 0);
-            // assert(bar.table_builder.value_count < Table.layout.block_value_count_max);
+            // assert(compaction.values_in[0].len > 0);
+            // assert(compaction.values_in[1].len > 0);
+            assert(bar.table_builder.value_count < Table.layout.block_value_count_max);
 
-            // // Copy variables locally to ensure a tight loop.
-            // // TODO: Actually benchmark this.
-            // var source_a_local = bar.source_a;
-            // var source_b_local = bar.source_b;
-            // const values_out = bar.table_builder.data_block_values();
-            // var values_out_index = bar.table_builder.value_count;
+            // Copy variables locally to ensure a tight loop.
+            const source_a_local: []const Value = if (bar.table_info_a == .immutable) blk: {
+                break :blk bar.source_a_immutable_values.?;
+            } else blk: {
+                const block = beat.blocks.?.source_value_blocks[0].ready.peek().?.block;
+                var values = Table.data_block_values_used(block);
+                break :blk values[bar.source_a_position.value_block_index..];
+            };
+            const source_b_local = blk: {
+                const block = beat.blocks.?.source_value_blocks[1].ready.peek().?.block;
+                break :blk Table.data_block_values_used(block)[bar.source_b_position.value_block_index..];
+            };
 
-            // var value_a = source_a_local.next();
-            // var value_b = source_b_local.next();
+            const values_out = bar.table_builder.data_block_values();
+            var source_a_index: usize = 0;
+            var source_b_index: usize = 0;
+            var values_out_index = bar.table_builder.value_count;
 
-            // // Merge as many values as possible.
-            // while (value_a != null and value_b != null and values_out_index < values_out.len) {
-            //     // std.log.info("Val A: {?} - is tombstone: {} - kfv: {}", .{ value_a, tombstone(&value_a.?), key_from_value(&value_a.?) });
-            //     // std.log.info("Val B: {?} - is tombstone: {} - kfv: {}", .{ value_b, tombstone(&value_b.?), key_from_value(&value_b.?) });
-            //     switch (std.math.order(key_from_value(&value_a.?), key_from_value(&value_b.?))) {
-            //         .lt => {
-            //             if (drop_tombstones and
-            //                 tombstone(&value_a.?))
-            //             {
-            //                 assert(Table.usage != .secondary_index);
-            //                 continue;
-            //             }
-            //             values_out[values_out_index] = value_a.?;
-            //             values_out_index += 1;
+            // Merge as many values as possible.
+            while (source_a_index < source_a_local.len and
+                source_b_index < source_b_local.len and
+                values_out_index < values_out.len)
+            {
+                const value_a = &source_a_local[source_a_index];
+                const value_b = &source_b_local[source_b_index];
+                switch (std.math.order(key_from_value(value_a), key_from_value(value_b))) {
+                    .lt => {
+                        source_a_index += 1;
+                        if (bar.drop_tombstones and
+                            tombstone(value_a))
+                        {
+                            assert(Table.usage != .secondary_index);
+                            continue;
+                        }
+                        values_out[values_out_index] = value_a.*;
+                        values_out_index += 1;
+                    },
+                    .gt => {
+                        source_b_index += 1;
+                        values_out[values_out_index] = value_b.*;
+                        values_out_index += 1;
+                    },
+                    .eq => {
+                        source_a_index += 1;
+                        source_b_index += 1;
 
-            //             value_a = source_a_local.next();
-            //         },
-            //         .gt => {
-            //             values_out[values_out_index] = value_b.?;
-            //             values_out_index += 1;
+                        if (Table.usage == .secondary_index) {
+                            // Secondary index optimization --- cancel out put and remove.
+                            assert(tombstone(value_a) != tombstone(value_b));
+                            continue;
+                        } else if (bar.drop_tombstones) {
+                            if (tombstone(value_a)) {
+                                continue;
+                            }
+                        }
 
-            //             value_b = source_b_local.next();
-            //         },
-            //         .eq => {
-            //             if (Table.usage == .secondary_index) {
-            //                 // Secondary index optimization --- cancel out put and remove.
-            //                 assert(tombstone(&value_a.?) != tombstone(&value_b.?));
-            //                 value_a = source_a_local.next();
-            //                 value_b = source_b_local.next();
-            //                 continue;
-            //             } else if (drop_tombstones) {
-            //                 if (tombstone(&value_a.?)) {
-            //                     value_a = source_a_local.next();
-            //                     value_b = source_b_local.next();
-            //                     continue;
-            //                 }
-            //             }
+                        values_out[values_out_index] = value_a.*;
+                        values_out_index += 1;
+                    },
+                }
+            }
 
-            //             values_out[values_out_index] = value_a.?;
-            //             values_out_index += 1;
-
-            //             value_a = source_a_local.next();
-            //             value_b = source_b_local.next();
-            //         },
-            //     }
-            // }
-
-            // // Copy variables back out.
-            // bar.source_a = source_a_local;
-            // bar.source_b = source_b_local;
-            // bar.table_builder.value_count = values_out_index;
+            // Copy variables back out.
+            if (bar.table_info_a == .immutable) {
+                bar.source_a_immutable_values = source_a_local[source_a_index..];
+            } else {
+                bar.source_a_position.value_block_index = source_a_index;
+            }
+            bar.source_b_position.value_block_index = source_b_index;
+            bar.table_builder.value_count = values_out_index;
         }
     };
 }
