@@ -90,8 +90,8 @@ pub const BlipStage = enum { read, merge, write, drained };
 pub fn CompactionHelperType(comptime Grid: type) type {
     return struct {
         pub const CompactionBlocks = struct {
-            /// Index blocks are global, and shared between blips.
-            /// FIXME: This complicates things somewhat.
+            /// Index blocks are global, and shared between blips. The index reads happen
+            /// as a mini-stage before reads kick off.
             source_index_blocks: []CompactionBlock,
 
             /// For each source level, we have a buffer of CompactionBlocks.
@@ -184,6 +184,7 @@ pub fn CompactionHelperType(comptime Grid: type) type {
     };
 }
 
+/// Helper for the forest to dynamically dispatch the underlying Compaction type.
 pub fn CompactionInterfaceType(comptime Grid: type, comptime tree_infos: anytype) type {
     const Helpers = CompactionHelperType(Grid);
 
@@ -266,7 +267,7 @@ pub fn CompactionInterfaceType(comptime Grid: type, comptime tree_infos: anytype
             };
         }
 
-        // FIXME: Very unhappy with the callback style here!
+        // FIXME: Not happy with the callback style here and below!
         pub fn blip_read(self: *Self, callback: BlipCallback) void {
             return switch (self.dispatcher) {
                 inline else => |compaction_impl| compaction_impl.blip_read(callback, self),
@@ -414,11 +415,6 @@ pub fn CompactionType(
                 callback: BlipCallback,
                 ptr: *anyopaque,
 
-                // These are blip local state. The value of target_value_block_index is copied out
-                // at the end of the merge (by reslicing the blocks), so that the upcoming
-                // blip_write knows what to write.
-                target_value_block_index: usize = 0,
-
                 next_tick: Grid.NextTick = undefined,
                 timer: std.time.Timer,
             };
@@ -434,6 +430,7 @@ pub fn CompactionType(
 
             grid_reservation: ?Grid.Reservation,
 
+            // FIXME: This is now always 0 / 1 so get rid of it and just use index_read_done?
             index_blocks_read_b: usize = 0,
             index_read_done: bool = false,
             blocks: ?Helpers.CompactionBlocks = null,
@@ -597,7 +594,6 @@ pub fn CompactionType(
             // level_b 0 is special; unlike all the others which have level_a on disk, level 0's
             // level_a comes from the immutable table. This means that blip_read will be a partial,
             // no-op, and that the minimum input blocks are lowered by one.
-            // TODO: Actually make use of the above information.
             if (compaction.level_b == 0) {
                 // Do not start compaction if the immutable table does not require compaction.
                 if (tree.table_immutable.mutability.immutable.flushed) {
@@ -820,19 +816,15 @@ pub fn CompactionType(
         //
         // Within a single compaction, the pipeline looks something like:
         // --------------------------------------------------
-        // | Ra₀    | Ca₀     | Wa₀     | Ra₁    |          |
+        // | R     | M       | W      | R      |           |
         // --------------------------------------------------
-        // |       | Ra₁     | Ca₁     | Wa₁     |           |
+        // |       | R      | M       | W      |           |
         // --------------------------------------------------
-        // |       |        | Ra₀     | Ca₀ → E | Wb₀       |
+        // |       |        | W      | C → E  | W          |
         // --------------------------------------------------
         //
-        // Where → D means that the result of the read were discarded, and → E means that the merge
-        // step indicated our work was complete for either this beat or bar.
-        //
-        // Internally, we have a split counter - the first time blip_read() is called, it works on
-        // buffer split 0, the next time on buffer set 1 and this alternates. The same process
-        // happens with blip_merge() and blip_write(), which we represent as eg blip_merge(0).
+        // Where → E means that the merge step indicated our work was complete for either this beat
+        // or bar.
         //
         // At the moment, the forest won't pipeline different compactions from other tree-levels
         // together. It _can_ do this, but it requires a bit more thought in how memory is managed.
@@ -853,11 +845,7 @@ pub fn CompactionType(
             assert(compaction.beat != null);
             assert(compaction.bar.?.move_table == false);
 
-            const bar = &compaction.bar.?;
-            _ = bar;
             const beat = &compaction.beat.?;
-            const blocks = &beat.blocks.?;
-            _ = blocks;
 
             beat.activate_and_assert(.read, callback, ptr);
 
@@ -884,11 +872,6 @@ pub fn CompactionType(
 
             // TODO: index_block_a will always point to source_index_blocks[0] (even though if our
             // source is immutable this isn't needed! Future optimization)...
-            // ...
-            // THAT SAID:
-            // We currently (ab)use blocks.source_index_blocks[0] for storing values from our
-            // immutable iterator, so we can use the same functions.
-            //
             // index_block_b will be the index block of the table we're currently merging with.
             var read_target: usize = 0;
             switch (bar.table_info_a) {
@@ -908,7 +891,7 @@ pub fn CompactionType(
                 },
             }
 
-            // ALWAYS increment read_target for now, so index for table_a is in [0].
+            // ALWAYS increment read_target for now, so the index block for table_a is in [0].
             if (read_target == 0) read_target += 1;
 
             // TODO: We only support 2 index blocks and don't support spanning them at the moment :/
@@ -937,6 +920,7 @@ pub fn CompactionType(
             // Either we have pending index reads, in which case blip_read_data gets called by
             // blip_read_index_callback once all reads are done, or we don't, in which case call it
             // here.
+            // FIXME: Should switch this at the read_block() level...
             if (read.pending_reads_index == 0) {
                 beat.index_read_done = true;
 
@@ -959,13 +943,8 @@ pub fn CompactionType(
             read.pending_reads_index -= 1;
             read.timer_read += 1;
 
-            stdx.copy_disjoint(
-                .exact,
-                u8,
-                parent.block,
-                index_block,
-            );
-            log.info("blip_read({}): Copied index block.", .{0});
+            stdx.copy_disjoint(.exact, u8, parent.block, index_block);
+            log.info("blip_read({s}): Copied index block.", .{compaction.tree_config.name});
 
             if (read.pending_reads_index != 0) return;
 
@@ -1006,7 +985,7 @@ pub fn CompactionType(
                 while (i < value_blocks_used) {
                     var maybe_source_value_block = beat.blocks.?.source_value_blocks[0].free_to_pending();
 
-                    // Once our read buffer is full, break out of the outer loop.
+                    // Once our read buffer is full, break out of the loop.
                     if (maybe_source_value_block == null) break;
 
                     const source_value_block = maybe_source_value_block.?;
@@ -1095,16 +1074,13 @@ pub fn CompactionType(
 
             // TODO: This copies the block, we should try instead to steal it for the duration of
             // the compaction...
-            stdx.copy_disjoint(
-                .exact,
-                u8,
-                parent.block,
-                value_block,
-            );
+            stdx.copy_disjoint(.exact, u8, parent.block, value_block);
 
             // Join on all outstanding reads before continuing.
             if (read.pending_reads_data != 0) return;
 
+            // Unlike the blip_write which has to make use of an io'ing stage, the only thing
+            // that transitions read blocks to pending is blip_read_data, so it's safe here.
             while (beat.blocks.?.source_value_blocks[0].pending_to_ready() != null) {}
             while (beat.blocks.?.source_value_blocks[1].pending_to_ready() != null) {}
 
@@ -1163,7 +1139,7 @@ pub fn CompactionType(
 
             // Loop through the CPU work until we have nothing left.
             // FIXME: NB!! We need to take in account the values _not_ remaining in memory too. Ie, we need to blip
-            // if we still have values but we've exhausted in memory values!! We hack this by making read blip memory huge lol
+            // FIXME: Also, get rid of while(true)
             while (true) {
                 // Set the index block if needed.
                 if (bar.table_builder.state == .no_blocks) {
@@ -1188,7 +1164,7 @@ pub fn CompactionType(
                     compaction.fill_immutable_block();
                     break :blk bar.source_a_immutable_values.?.len == 0;
                 } else blk: {
-                    assert(false); // No disk for level a yhet
+                    assert(false); // FIXME: Not supported yet
                     const index_block = blocks.source_index_blocks[0].block;
                     const index_schema = schema.TableIndex.from(index_block);
 
@@ -1208,6 +1184,8 @@ pub fn CompactionType(
                 std.log.info("blip_merge({s}): source_a_exhausted={} source_b_exhausted={}.", .{ compaction.tree_config.name, source_a_exhausted, source_b_exhausted });
 
                 // Increment our state - level b
+                // FIXME: Very very likely this code, and other code is completely broken, in
+                // addition to being horrible. It's under construction :)
                 blk: {
                     if (source_b_exhausted) break :blk;
 
@@ -1256,8 +1234,9 @@ pub fn CompactionType(
 
                 // It is exceptionally important here to take note of what these checks mean: they
                 // apply when a source is _completely_ exhausted; ie, there's no more data on disk
-                // so the mode is switched. This _is not_ an optimization depending on what's in
-                // memory.
+                // so the mode is switched.
+                // FIXME: Assert the state transitions - if source_a_exhausted, it can never be
+                // unexhausted for that bar. (etc)
                 if (source_a_exhausted and !source_b_exhausted) {
                     compaction.copy(.b);
                 } else if (source_b_exhausted and !source_a_exhausted) {
@@ -1270,6 +1249,7 @@ pub fn CompactionType(
                     compaction.merge_values();
                 }
 
+                // FIXME: We should be counting values processed, but WIP.
                 // const source_values_processed = (source_a_remaining - source_a.remaining_in_memory()) + (source_b_remaining - source_b.remaining_in_memory());
                 // assert(source_values_processed > 0);
 
@@ -1287,6 +1267,7 @@ pub fn CompactionType(
                 //
                 // This means that we'll potentially overrun our per_beat_input_goal by up to
                 // a full value block.
+                // FIXME: The exhausted logic here is currently TODO after moving to block based.
                 source_exhausted_bar = source_a_exhausted and source_b_exhausted; //bar.source_values_processed == bar.compaction_tables_value_count;
                 source_exhausted_beat = source_exhausted_bar; //beat.source_values_processed >= bar.per_beat_input_goal;
 
@@ -1324,7 +1305,9 @@ pub fn CompactionType(
                 if (bar.table_info_a == .disk)
                     compaction.release_table_blocks(blocks.source_index_blocks[0].block);
 
-                // FIXME: Do this where we increment the table block...
+                // FIXME: Do this where we increment the table block - since we only have
+                // one table block in memory at a time, we need to release it before we
+                // move on!
                 for (blocks.source_index_blocks[1 .. beat.index_blocks_read_b + 1]) |*block|
                     compaction.release_table_blocks(block.block);
             }
@@ -1440,6 +1423,7 @@ pub fn CompactionType(
             assert(target_count > 0);
             return target_count;
         }
+
         fn check_and_finish_blocks(compaction: *Compaction, force_flush: bool) enum {
             unfinished_value_block,
             finished_value_block,
@@ -1489,7 +1473,6 @@ pub fn CompactionType(
 
                 assert(target_index_blocks.pending.count == 1);
                 _ = target_index_blocks.pending_to_ready().?;
-                std.log.info("WTFFF: {}", .{target_index_blocks.ready.count});
 
                 // Make this table visible at the end of this bar.
                 bar.manifest_entries.append_assume_capacity(.{
@@ -1697,9 +1680,7 @@ pub fn CompactionType(
             compaction.bar = null;
         }
 
-        // TODO: Add benchmarks for these CPU merge methods. merge_values() is the most general,
-        // and could handle both what copy_drop_tombstones() and Iterator.copy() do, but we expect
-        // copy() -> copy_drop_tombstones() -> merge_values() in terms of performance.
+        // TODO: Add benchmarks for these CPU merge methods.
         fn copy(compaction: *Compaction, comptime source: enum { a, b }) void {
             const bar = &compaction.bar.?;
             const beat = &compaction.beat.?;
@@ -1710,6 +1691,7 @@ pub fn CompactionType(
 
             // Copy variables locally to ensure a tight loop.
             // TODO: Actually benchmark this.
+            // FIXME: The code to get the source value block is very meh at the moment, for all the methods.
             const source_local = if (source == .a) blk: {
                 if (bar.table_info_a == .immutable) {
                     break :blk bar.source_a_immutable_values.?;

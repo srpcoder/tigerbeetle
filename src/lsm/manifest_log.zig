@@ -655,7 +655,9 @@ pub fn ManifestLogType(comptime Storage: type) type {
                 manifest_log.blocks_closed + @intFromBool(manifest_log.entry_count > 0));
             assert(manifest_log.compact_blocks == null);
 
-            // FIXME: Currently manifest compaction is hardcoded to run on the last beat of each bar.
+            // FIXME: Currently manifest compaction is hardcoded to run on the last beat of each half-bar.
+            // This is because otherwise it would mess with our grid reserve / forfeit ordering, since
+            // we now reserve per beat.
             std.log.info("Manifest compaction running for op: {}", .{op});
             // assert(op % @divExact(constants.lsm_batch_multiple, 2) == 0);
 
