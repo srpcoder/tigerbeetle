@@ -2881,6 +2881,8 @@ pub fn ReplicaType(
         }
 
         fn on_pulse_timeout(self: *Self) void {
+            if (constants.aof_recovery) unreachable;
+
             assert(self.status == .normal);
             assert(self.primary());
             assert(self.pulse_timeout.ticking);
@@ -2896,8 +2898,8 @@ pub fn ReplicaType(
                 @as(u64, @intCast(realtime)),
             );
 
-            if (self.state_machine.pulse_operation()) |pulse| {
-                self.pulse_inject(pulse);
+            if (self.state_machine.pulse_operation()) |pulse_operation| {
+                self.pulse_inject(pulse_operation);
             } else {
                 self.pulse_timeout.reset();
             }
@@ -5209,15 +5211,17 @@ pub fn ReplicaType(
                         request.message.body(),
                     );
 
-                    // Check if the StateMachine needs to execute something before
-                    // the request.
-                    // Note that `prepare` must be called before so the StateMachine can
-                    // correctly assure that time-dependant tasks (e.g. expiring transfers)
-                    // will never intersect with a request batch.
-                    if (self.state_machine.pulse_operation()) |pulse_operation| {
-                        self.pulse_inject(pulse_operation);
-                        self.pipeline.queue.delay_request(request);
-                        return;
+                    if (!constants.aof_recovery) {
+                        // Check if the StateMachine needs to execute something before
+                        // the request.
+                        // Note that `prepare` must be called before so the StateMachine can
+                        // correctly assure that time-dependant tasks (e.g. expiring transfers)
+                        // will never intersect with a request batch.
+                        if (self.state_machine.pulse_operation()) |pulse_operation| {
+                            self.pulse_inject(pulse_operation);
+                            self.pipeline.queue.delay_request(request);
+                            return;
+                        }
                     }
                 },
             }
@@ -5278,8 +5282,11 @@ pub fn ReplicaType(
                 self.prepare_timeout.start();
                 self.primary_abdicate_timeout.start();
             }
-            assert(self.pulse_timeout.ticking);
-            self.pulse_timeout.reset();
+
+            if (!constants.aof_recovery) {
+                assert(self.pulse_timeout.ticking);
+                self.pulse_timeout.reset();
+            }
 
             self.pipeline.queue.push_prepare(message);
             self.on_prepare(message);
@@ -7417,7 +7424,7 @@ pub fn ReplicaType(
                 self.commit_message_timeout.start();
                 self.repair_timeout.start();
                 self.grid_repair_message_timeout.start();
-                self.pulse_timeout.start();
+                if (!constants.aof_recovery) self.pulse_timeout.start();
 
                 self.pipeline.cache.deinit(self.message_bus.pool);
                 self.pipeline = .{ .queue = .{} };
@@ -7545,7 +7552,7 @@ pub fn ReplicaType(
                 self.request_start_view_message_timeout.stop();
                 self.repair_timeout.start();
                 self.grid_repair_message_timeout.start();
-                self.pulse_timeout.start();
+                if (!constants.aof_recovery) self.pulse_timeout.start();
 
                 // Do not reset the pipeline as there may be uncommitted ops to drive to completion.
                 if (self.pipeline.queue.prepare_queue.count > 0) {
