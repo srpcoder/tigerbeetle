@@ -78,39 +78,39 @@ pub fn StateMachineType(
             pub const tree_ids = struct {
                 pub const accounts = .{
                     .id = 1,
-                    // .debits_pending = 2,
-                    // .debits_posted = 3,
-                    // .credits_pending = 4,
-                    // .credits_posted = 5,
-                    // .user_data_128 = 6,
-                    // .user_data_64 = 7,
-                    // .user_data_32 = 8,
-                    // .ledger = 9,
-                    // .code = 10,
-                    .timestamp = 2,
+                    .debits_pending = 2,
+                    .debits_posted = 3,
+                    .credits_pending = 4,
+                    .credits_posted = 5,
+                    .user_data_128 = 6,
+                    .user_data_64 = 7,
+                    .user_data_32 = 8,
+                    .ledger = 9,
+                    .code = 10,
+                    .timestamp = 11,
                 };
 
                 pub const transfers = .{
-                    .id = 3,
-                    // .debit_account_id = 13,
-                    // .credit_account_id = 14,
-                    // .amount = 15,
-                    // .pending_id = 16,
-                    // .user_data_128 = 17,
-                    // .user_data_64 = 18,
-                    // .user_data_32 = 19,
-                    // .timeout = 20,
-                    // .ledger = 21,
-                    // .code = 22,
-                    .timestamp = 4,
+                    .id = 12,
+                    .debit_account_id = 13,
+                    .credit_account_id = 14,
+                    .amount = 15,
+                    .pending_id = 16,
+                    .user_data_128 = 17,
+                    .user_data_64 = 18,
+                    .user_data_32 = 19,
+                    .timeout = 20,
+                    .ledger = 21,
+                    .code = 22,
+                    .timestamp = 23,
                 };
 
                 pub const posted = .{
-                    .timestamp = 5,
+                    .timestamp = 24,
                 };
 
                 pub const account_history = .{
-                    .timestamp = 6,
+                    .timestamp = 25,
                 };
             };
         };
@@ -175,6 +175,33 @@ pub fn StateMachineType(
                 .ids = constants.tree_ids.accounts,
                 .value_count_max = .{
                     .id = config.lsm_batch_multiple * constants.batch_max.create_accounts,
+                    // Transfers mutate the secondary indices for debits/credits pending/posted.
+                    //
+                    // * Each mutation results in a remove and an insert: the ×2 multiplier.
+                    // * Each transfer modifies two accounts. However, this does not
+                    //   necessitate an additional ×2 multiplier — the credits of the debit
+                    //   account and the debits of the credit account are not modified.
+                    .debits_pending = config.lsm_batch_multiple * @as(usize, @max(
+                        constants.batch_max.create_accounts,
+                        2 * constants.batch_max.create_transfers,
+                    )),
+                    .debits_posted = config.lsm_batch_multiple * @as(usize, @max(
+                        constants.batch_max.create_accounts,
+                        2 * constants.batch_max.create_transfers,
+                    )),
+                    .credits_pending = config.lsm_batch_multiple * @as(usize, @max(
+                        constants.batch_max.create_accounts,
+                        2 * constants.batch_max.create_transfers,
+                    )),
+                    .credits_posted = config.lsm_batch_multiple * @as(usize, @max(
+                        constants.batch_max.create_accounts,
+                        2 * constants.batch_max.create_transfers,
+                    )),
+                    .user_data_128 = config.lsm_batch_multiple * constants.batch_max.create_accounts,
+                    .user_data_64 = config.lsm_batch_multiple * constants.batch_max.create_accounts,
+                    .user_data_32 = config.lsm_batch_multiple * constants.batch_max.create_accounts,
+                    .ledger = config.lsm_batch_multiple * constants.batch_max.create_accounts,
+                    .code = config.lsm_batch_multiple * constants.batch_max.create_accounts,
                     // Transfers mutate the account balance for debits/credits pending/posted.
                     // Each transfer modifies two accounts.
                     .timestamp = config.lsm_batch_multiple * @as(usize, @max(
@@ -182,7 +209,7 @@ pub fn StateMachineType(
                         2 * constants.batch_max.create_transfers,
                     )),
                 },
-                .ignored = &[_][]const u8{ "flags", "reserved", "debits_pending", "debits_posted", "credits_pending", "credits_posted", "user_data_128", "user_data_64", "user_data_32", "ledger", "code" },
+                .ignored = &[_][]const u8{ "flags", "reserved" },
                 .derived = .{},
             },
         );
@@ -194,9 +221,21 @@ pub fn StateMachineType(
                 .ids = constants.tree_ids.transfers,
                 .value_count_max = .{
                     .timestamp = config.lsm_batch_multiple * constants.batch_max.create_transfers,
+                    .debit_account_id = config.lsm_batch_multiple * constants.batch_max.create_transfers,
+                    .credit_account_id = config.lsm_batch_multiple * constants.batch_max.create_transfers,
+                    .amount = config.lsm_batch_multiple * constants.batch_max.create_transfers,
+                    .pending_id = config.lsm_batch_multiple * constants.batch_max.create_transfers,
+                    .user_data_128 = config.lsm_batch_multiple * constants.batch_max.create_transfers,
+                    .user_data_64 = config.lsm_batch_multiple * constants.batch_max.create_transfers,
+                    .user_data_32 = config.lsm_batch_multiple * constants.batch_max.create_transfers,
+                    .timeout = config.lsm_batch_multiple * constants.batch_max.create_transfers,
+                    .ledger = config.lsm_batch_multiple * constants.batch_max.create_transfers,
+                    .code = config.lsm_batch_multiple * constants.batch_max.create_transfers,
                     .id = config.lsm_batch_multiple * constants.batch_max.create_transfers,
                 },
-                .ignored = &[_][]const u8{ "flags", "debit_account_id", "credit_account_id", "amount", "pending_id", "user_data_128", "user_data_64", "user_data_32", "timeout", "ledger", "code" },
+                .ignored = &[_][]const u8{
+                    "flags",
+                },
                 .derived = .{},
             },
         );
@@ -1566,7 +1605,17 @@ pub fn StateMachineType(
                     .cache_entries_max = options.cache_entries_accounts,
                     .tree_options_object = .{},
                     .tree_options_id = .{},
-                    .tree_options_index = .{},
+                    .tree_options_index = .{
+                        .user_data_128 = .{},
+                        .user_data_64 = .{},
+                        .user_data_32 = .{},
+                        .ledger = .{},
+                        .code = .{},
+                        .debits_pending = .{},
+                        .debits_posted = .{},
+                        .credits_pending = .{},
+                        .credits_posted = .{},
+                    },
                 },
                 .transfers = .{
                     // lookup_transfer() looks up 1 Transfer.
@@ -1577,7 +1626,18 @@ pub fn StateMachineType(
                     .cache_entries_max = options.cache_entries_transfers,
                     .tree_options_object = .{},
                     .tree_options_id = .{},
-                    .tree_options_index = .{},
+                    .tree_options_index = .{
+                        .debit_account_id = .{},
+                        .credit_account_id = .{},
+                        .user_data_128 = .{},
+                        .user_data_64 = .{},
+                        .user_data_32 = .{},
+                        .pending_id = .{},
+                        .timeout = .{},
+                        .ledger = .{},
+                        .code = .{},
+                        .amount = .{},
+                    },
                 },
                 .posted = .{
                     // Nothing lookups posted groove.

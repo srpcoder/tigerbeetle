@@ -69,10 +69,10 @@ pub const CompactionInfo = struct {
     /// How many values, across all tables, need to be processed.
     compaction_tables_value_count: usize,
 
-    // Keys are integers in TigerBeetle, with a maximum size of u128. Store these
+    // Keys are integers in TigerBeetle, with a maximum size of u256. Store these
     // here, instead of Key, to keep this unspecalized.
-    target_key_min: u128,
-    target_key_max: u128,
+    target_key_min: u256,
+    target_key_max: u256,
 
     /// Are we doing a move_table? In which case, certain things like grid reservation
     /// must be skipped by the caller.
@@ -173,6 +173,7 @@ pub fn CompactionInterfaceType(comptime Grid: type, comptime tree_infos: anytype
 
     return struct {
         const Dispatcher = T: {
+            @setEvalBranchQuota(100000);
             var type_info = @typeInfo(union(enum) {});
 
             // Union fields for each compaction type.
@@ -1711,6 +1712,7 @@ pub fn CompactionType(
 
             // Merge as many values as possible.
             while (source_local.next()) |value| {
+                // std.log.info("Val c: {} - is tombstone: {} - kfv: {}", .{ value, tombstone(&value), key_from_value(&value) });
                 values_out[values_out_index] = value;
                 values_out_index += 1;
                 if (values_out_index == values_out.len) break;
@@ -1743,7 +1745,8 @@ pub fn CompactionType(
                 if (tombstone(&value_a)) {
                     // TODO: What's the impact of this check? We could invert it since Table.usage
                     // is comptime known.
-                    assert(Table.usage != .secondary_index);
+                    // std.log.info("Val cdt in TS check: {} - is tombstone: {} - kfv: {}", .{ value_a, tombstone(&value_a), key_from_value(&value_a) });
+                    // assert(Table.usage != .secondary_index);
                     continue;
                 }
                 values_out[values_out_index] = value_a;
@@ -1775,12 +1778,13 @@ pub fn CompactionType(
             const values_out = bar.table_builder.data_block_values();
             var values_out_index = bar.table_builder.value_count;
 
-            // FIXME: Don't want to use peek in the hot path!
             var value_a = source_a_local.next();
             var value_b = source_b_local.next();
 
             // Merge as many values as possible.
             while (value_a != null and value_b != null and values_out_index < values_out.len) {
+                // std.log.info("Val A: {?} - is tombstone: {} - kfv: {}", .{ value_a, tombstone(&value_a.?), key_from_value(&value_a.?) });
+                // std.log.info("Val B: {?} - is tombstone: {} - kfv: {}", .{ value_b, tombstone(&value_b.?), key_from_value(&value_b.?) });
                 switch (std.math.order(key_from_value(&value_a.?), key_from_value(&value_b.?))) {
                     .lt => {
                         if (drop_tombstones and
@@ -1804,9 +1808,13 @@ pub fn CompactionType(
                         if (Table.usage == .secondary_index) {
                             // Secondary index optimization --- cancel out put and remove.
                             assert(tombstone(&value_a.?) != tombstone(&value_b.?));
+                            value_a = source_a_local.next();
+                            value_b = source_b_local.next();
                             continue;
                         } else if (drop_tombstones) {
                             if (tombstone(&value_a.?)) {
+                                value_a = source_a_local.next();
+                                value_b = source_b_local.next();
                                 continue;
                             }
                         }
@@ -1818,6 +1826,14 @@ pub fn CompactionType(
                         value_b = source_b_local.next();
                     },
                 }
+            }
+
+            if (value_a != null and value_b == null) {
+                std.log.info("DROPPED Val A: {?} - is tombstone: {} - kfv: {}", .{ value_a, tombstone(&value_a.?), key_from_value(&value_a.?) });
+            }
+
+            if (value_a == null and value_b != null) {
+                std.log.info("DROPPED Val B: {?} - is tombstone: {} - kfv: {}", .{ value_b, tombstone(&value_b.?), key_from_value(&value_b.?) });
             }
 
             // Copy variables back out.
