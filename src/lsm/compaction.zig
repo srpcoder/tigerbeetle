@@ -306,7 +306,7 @@ pub fn CompactionType(
         const tombstone = Table.tombstone;
 
         const TableInfoA = union(enum) {
-            immutable: *Tree.TableMemory,
+            immutable: []Value,
             disk: TableInfoReference,
         };
 
@@ -355,8 +355,7 @@ pub fn CompactionType(
             /// * It uses an iterator interface, as opposed to raw blocks like the rest.
             /// * It is responsible for keeping track of its own position, across beats.
             /// * It encompasses all possible values, so we don't need to worry about reading more.
-            source_a_immutable_iterator: ?Tree.TableMemory.Iterator,
-            source_a_block: BlockPtr,
+            source_a_block: ?BlockPtr,
             source_a_immutable_values: ?[]Value = null,
             source_a_position: Position = .{},
 
@@ -623,14 +622,12 @@ pub fn CompactionType(
                     .op_min = op,
 
                     .move_table = false,
-                    .table_info_a = .{ .immutable = &tree.table_immutable },
+                    .table_info_a = .{ .immutable = tree.table_immutable.values_used() },
                     .range_b = range_b,
                     .drop_tombstones = tree.manifest.compaction_must_drop_tombstones(
                         compaction.level_b,
                         range_b,
                     ),
-
-                    .source_a_immutable_iterator = tree.table_immutable.iterator(),
 
                     .compaction_tables_value_count = compaction_tables_value_count,
 
@@ -673,8 +670,6 @@ pub fn CompactionType(
                         compaction.level_b,
                         range_b,
                     ),
-
-                    .source_a_immutable_iterator = null,
 
                     .compaction_tables_value_count = compaction_tables_value_count,
 
@@ -843,16 +838,12 @@ pub fn CompactionType(
             assert(compaction.bar.?.move_table == false);
 
             const bar = &compaction.bar.?;
+            _ = bar;
             const beat = &compaction.beat.?;
             const blocks = &beat.blocks.?;
+            _ = blocks;
 
             beat.activate_and_assert(.read, callback, ptr);
-
-            if (bar.table_info_a == .immutable) {
-                if (bar.source_a_immutable_values == null or bar.source_a_immutable_values.?.len == 0) {
-                    bar.source_a_immutable_values = Table.data_block_values(blocks.source_index_blocks[0]);
-                }
-            }
 
             // FIXME: Must set beat.index_read_done to false when advancing index block!!
             if (!beat.index_read_done) {
@@ -1155,7 +1146,7 @@ pub fn CompactionType(
             // Loop through the CPU work until we have nothing left.
             // FIXME: NB!! We need to take in account the values _not_ remaining in memory too. Ie, we need to blip
             // if we still have values but we've exhausted in memory values!! We hack this by making read blip memory huge lol
-            while (source_a_remaining > 0 or source_b_remaining > 0) {
+            while (true) {
                 log.info("blip_merge(): remaining_in_memory: values_a={} values_b={}", .{ source_a_remaining, source_b_remaining });
 
                 // Set the index block if needed.
@@ -1176,13 +1167,24 @@ pub fn CompactionType(
                     bar.table_builder.set_data_block(value_block);
                 }
 
+                // Refill immutable values, if needed.
+                const source_a_exhausted = false;
+                compaction.fill_immutable_block();
+
+                const source_b_exhausted = false;
+
+                // Check if we have blocks available in memory, bail out if not.
+                if (false) {
+                    break;
+                }
+
                 // It is exceptionally important here to take note of what these checks mean: they
                 // apply when a source is _completely_ exhausted; ie, there's no more data on disk
                 // so the mode is switched. This _is not_ an optimization depending on what's in
                 // memory.
-                if (source_a_remaining == 0) {
+                if (source_a_exhausted == 0) {
                     compaction.copy(.b);
-                } else if (source_b_remaining == 0) {
+                } else if (source_b_exhausted) {
                     if (bar.drop_tombstones) {
                         compaction.copy_drop_tombstones();
                     } else {
@@ -1257,13 +1259,115 @@ pub fn CompactionType(
             });
         }
 
+        // FIXME: Collapse this into fill_immutable_values.
+        fn fill_immutable_block(compaction: *Compaction) enum { remaining, exhausted } {
+            const bar = &compaction.bar.?;
+
+            assert(bar.table_info_a == .immutable);
+            assert(bar.source_a_block != null);
+            stdx.maybe(bar.source_a_immutable_values == null);
+            assert(compaction.level_b == 0);
+
+            // If our immutable values 'block' is empty, refill it from its iterator.
+            if (bar.source_a_immutable_values == null or bar.source_a_immutable_values.?.len == 0) {
+                bar.source_a_immutable_values = Table.data_block_values(bar.source_a_block.?);
+                const filled = compaction.fill_immutable_values(bar.source_a_immutable_values.?);
+                bar.source_a_immutable_values = bar.source_a_immutable_values[0..filled];
+
+                if (filled == 0) return .exhausted;
+            }
+
+            // If we're not empty, we have values remaining.
+            return .remaining;
+        }
+
+        /// Copies values to `target` from our immutable table input. In the process, merge values
+        /// with identical keys (last one wins) and collapse tombstones for secondary indexes.
+        /// Return the number of values written to the output and updates immutable table slice to
+        /// the non-processed remainder.
+        fn fill_immutable_values(compaction: *Compaction, target: []Value) usize {
+            const bar = &compaction.bar.?;
+
+            var source = bar.table_info_a.immutable;
+            assert(source.len > 0);
+
+            if (constants.verify) {
+                // The input may have duplicate keys (last one wins), but keys must be
+                // non-decreasing.
+                // A source length of 1 is always non-decreasing.
+                for (source[0 .. source.len - 1], source[1..source.len]) |*value, *value_next| {
+                    assert(key_from_value(value) <= key_from_value(value_next));
+                }
+            }
+
+            var source_index: usize = 0;
+            var target_index: usize = 0;
+            while (target_index < target.len and source_index < source.len) {
+                target[target_index] = source[source_index];
+
+                // If we're at the end of the source, there is no next value, so the next value
+                // can't be equal.
+                const value_next_equal = source_index + 1 < source.len and
+                    key_from_value(&source[source_index]) ==
+                    key_from_value(&source[source_index + 1]);
+
+                if (value_next_equal) {
+                    if (Table.usage == .secondary_index) {
+                        // Secondary index optimization --- cancel out put and remove.
+                        // NB: while this prevents redundant tombstones from getting to disk, we
+                        // still spend some extra CPU work to sort the entries in memory. Ideally,
+                        // we annihilate tombstones immediately, before sorting, but that's tricky
+                        // to do with scopes.
+                        assert(tombstone(&source[source_index]) !=
+                            tombstone(&source[source_index + 1]));
+                        source_index += 2;
+                        target_index += 0;
+                    } else {
+                        // The last value in a run of duplicates needs to be the one that ends up in
+                        // target.
+                        source_index += 1;
+                        target_index += 0;
+                    }
+                } else {
+                    source_index += 1;
+                    target_index += 1;
+                }
+            }
+
+            // At this point, source_index and target_index are actually counts.
+            // source_index will always be incremented after the final iteration as part of the
+            // continue expression.
+            // target_index will always be incremented, since either source_index runs out first
+            // so value_next_equal is false, or a new value is hit, which will increment it.
+            const source_count = source_index;
+            const target_count = target_index;
+            assert(target_count <= source_count);
+            bar.table_info_a.immutable =
+                bar.table_info_a.immutable[source_count..];
+
+            if (target_count == 0) {
+                assert(Table.usage == .secondary_index);
+                return 0;
+            }
+
+            if (constants.verify) {
+                // Our output must be strictly increasing.
+                // An output length of 1 is always strictly increasing.
+                for (
+                    target[0 .. target_count - 1],
+                    target[1..target_count],
+                ) |*value, *value_next| {
+                    assert(key_from_value(value_next) > key_from_value(value));
+                }
+            }
+
+            assert(target_count > 0);
+            return target_count;
+        }
         fn check_and_finish_blocks(compaction: *Compaction, force_flush: bool) enum {
             unfinished_value_block,
             finished_value_block,
         } {
-            assert(compaction.bar != null);
-            assert(compaction.beat != null);
-
             const bar = &compaction.bar.?;
             const beat = &compaction.beat.?;
 
