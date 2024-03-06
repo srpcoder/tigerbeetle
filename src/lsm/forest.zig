@@ -318,6 +318,8 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                         // I've already wasted enough time on a problem I knew about :D
                         std.log.info("Index block range is: [{}..{}]", .{ 900 + i * 2, 900 + i * 2 + 2 });
                         const blocks = self.compaction_blocks[900 + i * 2 .. 900 + i * 2 + 2];
+                        const single_block = self.compaction_blocks[950 + i].block;
+                        std.log.info("Immutable dummy block is: [{}]", .{950 + i});
 
                         for (blocks) |*block| {
                             block.next = null;
@@ -332,7 +334,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
                             // ... and has its bar scoped buffers and budget assigned.
                             // TODO: This is an _excellent_ value to fuzz on.
-                            compaction.bar_setup_budget(1, ring_buffer);
+                            compaction.bar_setup_budget(1, ring_buffer, single_block);
                         }
                     }
                 }
