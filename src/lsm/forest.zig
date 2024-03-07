@@ -21,6 +21,7 @@ const CompactionHelperType = @import("compaction.zig").CompactionHelperType;
 const BlipStage = @import("compaction.zig").BlipStage;
 const Exhausted = @import("compaction.zig").Exhausted;
 const snapshot_min_for_table_output = @import("compaction.zig").snapshot_min_for_table_output;
+const IO = @import("../io.zig").IO;
 
 const table_count_max = @import("tree.zig").table_count_max;
 
@@ -203,6 +204,11 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
             slots: [3]?PipelineSlot = .{ null, null, null },
             slot_filled_count: usize = 0,
             slot_running_count: usize = 0,
+
+            // Used for invoking the CPU work after a next_tick.
+            // FIXME: Should be a ptr!
+            cpu_timeout_completion: IO.Completion = undefined,
+            cpu_slot: ?usize = null,
 
             state: enum { filling, full, draining, drained } = .filling,
 
@@ -459,7 +465,6 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                 };
                 log.info("advance_pipeline: Active compaction is: {}", .{active_compaction_index});
 
-                var cpu: ?usize = null;
                 if (self.state == .filling or self.state == .full) {
                     // Advanced the current stages, making sure to start our IO before CPU.
                     for (self.slots[0..self.slot_filled_count], 0..) |*slot_wrapped, i| {
@@ -467,8 +472,20 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
                         switch (slot.active_operation) {
                             .read => {
-                                assert(cpu == null);
-                                cpu = i;
+                                assert(self.cpu_slot == null);
+
+                                self.cpu_slot = i;
+                                slot.active_operation = .merge;
+                                self.slot_running_count += 1;
+
+                                log.info("Slot: {} schedling blip_merge for timeout(1)...", .{self.cpu_slot.?});
+                                self.grid.superblock.storage.io.timeout(
+                                    *Storage,
+                                    self.grid.superblock.storage,
+                                    dispatch_cpu_timeout_callback,
+                                    &self.cpu_timeout_completion,
+                                    1, // NB!!! 1 not 0
+                                );
                             },
                             .merge => {
                                 slot.active_operation = .write;
@@ -554,16 +571,20 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
 
                     return self.advance_pipeline();
                 }
+            }
 
-                // Now that IO has been dispatched, start CPU work if there was any.
-                if (cpu) |cpu_slot| {
-                    const slot = &self.slots[cpu_slot].?;
+            fn dispatch_cpu_timeout_callback(storage: *Storage, completion: *IO.Completion, result: IO.TimeoutError!void) void {
+                _ = result catch unreachable;
+                _ = storage;
+                const self = @fieldParentPtr(CompactionPipeline, "cpu_timeout_completion", completion);
 
-                    slot.active_operation = .merge;
-                    self.slot_running_count += 1;
-                    log.info("Slot: {} Calling blip_merge", .{cpu_slot});
-                    slot.interface.blip_merge(blip_callback);
-                }
+                const cpu_slot = self.cpu_slot.?;
+                self.cpu_slot = null;
+
+                const slot = &self.slots[cpu_slot].?;
+
+                log.info("Slot: {} Calling blip_merge", .{cpu_slot});
+                slot.interface.blip_merge(blip_callback);
             }
 
             fn beat_grid_forfeit_all(self: *CompactionPipeline) void {

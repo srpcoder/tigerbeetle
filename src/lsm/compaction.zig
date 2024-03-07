@@ -1243,6 +1243,14 @@ pub fn CompactionType(
                 }
             }
 
+            // std.log.info("bip_merge busy looping", .{});
+            // var i: usize = 0;
+            // while (i < 10000000) {
+            //     assert(i < 10000000);
+            //     _ = merge.timer.read();
+            //     i += 1;
+            // }
+
             // // FIXME: Check at least one output value.
             // // assert(filled <= target.len);
             // // if (filled == 0) assert(Table.usage == .secondary_index);
