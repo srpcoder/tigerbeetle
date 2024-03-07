@@ -160,6 +160,13 @@ pub fn CompactionHelperType(comptime Grid: type) type {
                 return value;
             }
 
+            pub fn pending_to_free(self: *BlockFIFO) ?*CompactionBlock {
+                const value = self.pending.pop() orelse return null;
+                self.free.push(value);
+
+                return value;
+            }
+
             pub fn ready_to_ioing(self: *BlockFIFO) ?*CompactionBlock {
                 const value = self.ready.pop() orelse return null;
                 self.ioing.push(value);
@@ -1153,6 +1160,7 @@ pub fn CompactionType(
                 if (bar.table_builder.state == .no_blocks) {
                     if (target_index_blocks.ready.count == @divExact(target_index_blocks.count, 2)) break;
 
+                    std.log.info("set index block!", .{});
                     const index_block = target_index_blocks.free_to_pending().?.block;
                     @memset(index_block, 0); // FIXME: We don't need to zero the whole block; just the part of the padding that's not covered by alignment.
                     bar.table_builder.set_index_block(index_block);
@@ -1162,7 +1170,10 @@ pub fn CompactionType(
                 if (bar.table_builder.state == .index_block) {
                     if (target_value_blocks.ready.count == @divExact(target_value_blocks.count, 2)) break;
 
+                    std.log.info("set value block!", .{});
                     const value_block = target_value_blocks.free_to_pending().?.block;
+                    std.log.info("YYYY target_value_blocks.pending is {}", .{target_value_blocks.pending.count});
+
                     @memset(value_block, 0); // FIXME: We don't need to zero the whole block; just the part of the padding that's not covered by alignment.
                     bar.table_builder.set_data_block(value_block);
                 }
@@ -1318,6 +1329,7 @@ pub fn CompactionType(
             const beat = &compaction.beat.?;
             const blocks = &beat.blocks.?;
 
+            std.log.info("Checking and refilling b...", .{});
             std.log.info("bar.source_b_position = {}, bar.range_b.tables.count() = {}", .{ bar.source_b_position, bar.range_b.tables.count() });
 
             if (bar.range_b.tables.empty()) {
@@ -1362,8 +1374,11 @@ pub fn CompactionType(
             const beat = &compaction.beat.?;
             const blocks = &beat.blocks.?;
 
+            std.log.info("update_position_b: source_b_values.len: {?}", .{if (beat.source_b_values) |v| v.len else null});
+
             if (beat.source_b_values != null and beat.source_b_values.?.len > 0) {
                 // FIXME: Need to update bar.source_b_position.value_block_index for if we tick over beats.
+                std.log.info("update_position_b: values still remaining so not doing anything", .{});
                 return 100;
             }
             if (bar.range_b.tables.empty()) return 0;
@@ -1377,16 +1392,17 @@ pub fn CompactionType(
             const index_schema = schema.TableIndex.from(index_block);
             const value_blocks_used = index_schema.data_blocks_used(index_block);
 
-            if (bar.source_b_position.value_block == value_blocks_used) {
-                assert(false);
-                // bar.source_b_position.value_block = 0;
-                // bar.source_b_position.index_block += 1;
+            std.log.info("bar.source_b_position.value_block: {} value_blocks_used: {}", .{ bar.source_b_position.value_block, value_blocks_used });
 
-                // // FIXME: Perhaps this logic should be in read rather?
-                // if (bar.source_b_position.index_block < bar.range_b.tables.count()) {
-                //     beat.index_read_done = false;
-                //     beat.index_blocks_read_b = 0;
-                // }
+            if (bar.source_b_position.value_block == value_blocks_used) {
+                bar.source_b_position.value_block = 0;
+                bar.source_b_position.index_block += 1;
+
+                // FIXME: Perhaps this logic should be in read rather?
+                if (bar.source_b_position.index_block < bar.range_b.tables.count()) {
+                    beat.index_read_done = false;
+                    beat.index_blocks_read_b = 0;
+                }
             }
             return 100;
 
@@ -1546,8 +1562,11 @@ pub fn CompactionType(
             const table_builder = &bar.table_builder;
 
             var finished_value_block = false;
+            assert(bar.table_builder.state == .index_and_data_block);
 
             // Flush the value block if needed.
+            std.log.info("Ahh table state: {s}", .{@tagName(table_builder.state)});
+            std.log.info("Ahh table: {}", .{table_builder.data_block_empty()});
             if (table_builder.data_block_full() or
                 table_builder.index_block_full() or
                 (force_flush and !table_builder.data_block_empty()))
@@ -1561,7 +1580,15 @@ pub fn CompactionType(
                 });
 
                 assert(target_value_blocks.pending.count == 1);
+                std.log.info("XXXX target_value_blocks.pending is {}", .{target_value_blocks.pending.count});
                 _ = target_value_blocks.pending_to_ready().?;
+                finished_value_block = true;
+            } else if (force_flush and table_builder.data_block_empty()) {
+                // Will likely need the same logic for index block.
+                std.log.info("target_value_blocks.pending is {}", .{target_value_blocks.pending.count});
+                assert(target_value_blocks.pending.count == 1);
+                _ = target_value_blocks.pending_to_free().?;
+                table_builder.state = .index_block;
                 finished_value_block = true;
             }
 
@@ -1815,10 +1842,8 @@ pub fn CompactionType(
             if (source == .a) {
                 beat.source_a_values = source_local[len..];
                 if (bar.table_info_a == .immutable) bar.source_a_immutable_values = beat.source_a_values;
-                bar.source_a_position.value_block_index += len;
             } else {
                 beat.source_b_values = source_local[len..];
-                bar.source_b_position.value_block_index += len;
             }
 
             bar.table_builder.value_count += @as(u32, @intCast(len));
@@ -1862,7 +1887,6 @@ pub fn CompactionType(
             // Copy variables back out.
             beat.source_a_values = source_a_local[values_in_a_index..];
             if (bar.table_info_a == .immutable) bar.source_a_immutable_values = beat.source_a_values;
-            bar.source_a_position.value_block_index += values_in_a_index;
 
             bar.table_builder.value_count = values_out_index;
 
@@ -1935,12 +1959,9 @@ pub fn CompactionType(
             }
 
             // Copy variables back out.
-            beat.source_a_values = source_a_local;
+            beat.source_a_values = source_a_local[source_a_index..];
             if (bar.table_info_a == .immutable) bar.source_a_immutable_values = beat.source_a_values;
-            bar.source_a_position.value_block_index += source_a_index;
-
-            beat.source_b_values = source_b_local;
-            bar.source_b_position.value_block_index += source_b_index;
+            beat.source_b_values = source_b_local[source_b_index..];
 
             bar.table_builder.value_count = values_out_index;
         }
