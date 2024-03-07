@@ -807,6 +807,7 @@ pub fn CompactionType(
             // rather than panicking here.
             // (actually, we want to still panic but with something nicer like vsr.fail)
             const grid_reservation = compaction.grid.reserve(total_blocks_per_beat).?;
+            std.log.info("beat_grid_reserve(): total_blocks_per_beat={} index_blocks_per_beat={} value_blocks_per_beat={}", .{ total_blocks_per_beat, index_blocks_per_beat, value_blocks_per_beat });
 
             compaction.beat = .{
                 .grid_reservation = grid_reservation,
@@ -982,8 +983,9 @@ pub fn CompactionType(
             // only differing in _a vs _b and [0] vs [1]...
 
             // Read data for table a - which we'll only have if compaction.level_b > 0.
-            if (bar.table_info_a == .disk) {
+            if (bar.table_info_a == .disk and bar.source_a_position.index_block == 0) {
                 assert(beat.blocks.?.source_value_blocks[0].pending.empty());
+                assert(bar.source_a_position.index_block == 0);
 
                 var i: usize = bar.source_a_position.value_block + beat.blocks.?.source_value_blocks[0].ready.count;
 
@@ -1320,15 +1322,33 @@ pub fn CompactionType(
 
                 return .filled;
             } else {
-                assert(false); // FIXME: Not supported yet
-                return .need_read;
-                // const index_block = blocks.source_index_blocks[0].block;
-                // const index_schema = schema.TableIndex.from(index_block);
+                const blocks = &beat.blocks.?;
 
-                // const value_blocks_used = index_schema.data_blocks_used(index_block);
+                // Unlike with range_b, where we can have an empty index block, with table_a if
+                // we're not coming from the immutable table we have an index block by definition.
+                if (bar.source_a_position.index_block == 1) {
+                    beat.source_a_values = &.{};
+                    return .exhausted;
+                }
 
-                // break :blk bar.source_a_position.value_block == value_blocks_used and
-                //     bar.source_a_position.value_block_index == 1234; // FIXME
+                if (beat.source_a_values != null and beat.source_a_values.?.len > 0) return .filled;
+
+                std.log.info("Checks passed, performing fill for AAAAAAAAAAAAAAAAA...", .{});
+
+                if (blocks.source_value_blocks[0].ready.empty()) return .need_read;
+
+                const current_value_block = blocks.source_value_blocks[0].ready.peek().?.block;
+
+                // Verify this block is indeed the correct one.
+                const index_block = blocks.source_index_blocks[0].block;
+                const index_schema = schema.TableIndex.from(index_block);
+                const value_block_checksums = index_schema.data_checksums_used(index_block);
+                const current_value_block_header = schema.header_from_block(current_value_block);
+                assert(value_block_checksums[bar.source_a_position.value_block].value == current_value_block_header.checksum);
+
+                beat.source_a_values = Table.data_block_values_used(current_value_block)[bar.source_a_position.value_block_index..];
+
+                return .filled;
             }
         }
 
@@ -1370,7 +1390,42 @@ pub fn CompactionType(
 
         fn update_position_a(compaction: *Compaction) usize {
             const bar = &compaction.bar.?;
-            assert(bar.table_info_a == .immutable);
+            const beat = &compaction.beat.?;
+            const blocks = &beat.blocks.?;
+
+            std.log.info("update_position_a: source_a_values.len: {?} position_a: {}", .{ if (beat.source_a_values) |v| v.len else null, bar.source_a_position });
+
+            if (bar.table_info_a == .immutable) {
+                // Do we need to do anything?
+            } else {
+                if (beat.source_a_values != null and beat.source_a_values.?.len > 0) {
+                    // FIXME: Need to update bar.source_a_position.value_block_index for if we tick over beats.
+                    std.log.info("update_position_a: values still remaining so not doing anything", .{});
+                    return 100;
+                }
+
+                if (bar.source_a_position.index_block == 1) {
+                    return 0;
+                }
+
+                //
+
+                bar.source_a_position.value_block_index = 0;
+                bar.source_a_position.value_block += 1;
+                _ = blocks.source_value_blocks[0].ready_to_free(); // Pop off the now finished block from the ready queue.
+                std.log.info("Popped aaaaa value...", .{});
+
+                const index_block = blocks.source_index_blocks[0].block;
+                const index_schema = schema.TableIndex.from(index_block);
+                const value_blocks_used = index_schema.data_blocks_used(index_block);
+
+                std.log.info("bar.source_a_position: {} value_blocks_used: {}", .{ bar.source_a_position, value_blocks_used });
+
+                if (bar.source_a_position.value_block == value_blocks_used) {
+                    bar.source_a_position.value_block = 0;
+                    bar.source_a_position.index_block += 1;
+                }
+            }
 
             return 100;
 
@@ -1413,62 +1468,6 @@ pub fn CompactionType(
                 }
             }
             return 100;
-
-            // const index_block = blocks.source_index_blocks[1].block;
-            // const index_schema = schema.TableIndex.from(index_block);
-            // const value_blocks_used = index_schema.data_blocks_used(index_block);
-
-            // if (bar.source_b_position.value_block == value_blocks_used) {
-            //     bar.source_b_position.value_block = 0;
-            //     bar.source_b_position.index_block += 1;
-
-            //     // FIXME: Perhaps this logic should be in read rather?
-            //     if (bar.source_b_position.index_block < bar.range_b.tables.count()) {
-            //         beat.index_read_done = false;
-            //         beat.index_blocks_read_b = 0;
-            //     }
-            // }
-
-            // if (blocks.source_value_blocks[1].ready.count > 0)
-            //     _ = blocks.source_value_blocks[1].ready_to_free();
-
-            // std.log.info("Updated source_b_position to: [{}][{}][{}]", .{ bar.source_b_position.index_block, bar.source_b_position.value_block, bar.source_b_position.value_block_index });
-
-            // blk: {
-            //     if (source_b_exhausted) break :blk;
-
-            //     const current_value_block = blocks.source_value_blocks[1].ready.peek().?.block;
-            //     const value_count = Table.data_block_values_used(current_value_block).len;
-
-            //     std.log.info("Current VBI is: {} value_count is: {}", .{ bar.source_b_position.value_block_index, value_count });
-
-            //     if (bar.source_b_position.value_block_index == value_count) {
-            //         bar.source_b_position.value_block_index = 0;
-            //         bar.source_b_position.value_block += 1;
-
-            //         const index_block = blocks.source_index_blocks[1].block;
-            //         const index_schema = schema.TableIndex.from(index_block);
-
-            //         const value_blocks_used = index_schema.data_blocks_used(index_block);
-
-            //         if (bar.source_b_position.value_block == value_blocks_used) {
-            //             bar.source_b_position.value_block = 0;
-            //             bar.source_b_position.index_block += 1;
-
-            //             // FIXME: Perhaps this logic should be in read rather?
-            //             if (bar.source_b_position.index_block < bar.range_b.tables.count()) {
-            //                 beat.index_read_done = false;
-            //                 beat.index_blocks_read_b = 0;
-            //             }
-            //         }
-
-            //         if (blocks.source_value_blocks[1].ready.count > 0)
-            //             _ = blocks.source_value_blocks[1].ready_to_free();
-
-            //         std.log.info("Updated source_b_position to: [{}][{}][{}]", .{ bar.source_b_position.index_block, bar.source_b_position.value_block, bar.source_b_position.value_block_index });
-            //     }
-            // }
-
         }
 
         /// Copies values to `target` from our immutable table input. In the process, merge values

@@ -909,6 +909,7 @@ pub fn ForestType(comptime _Storage: type, comptime groove_cfg: anytype) type {
                     .idle => {},
                     .compacting => unreachable,
                     .done => {
+                        std.log.info("Calling manifest_log.compact_end()", .{});
                         forest.manifest_log.compact_end();
                         forest.manifest_log_progress = .idle;
                     },
