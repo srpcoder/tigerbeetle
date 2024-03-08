@@ -972,11 +972,11 @@ internal unsafe struct TBPacket
 
     public IntPtr data;
 
-    public TBPacket* batchLink;
+    private TBPacket* batchLink;
 
-    public ulong batchData;
+    private ulong batchData;
 
-    public ReservedData reserved;
+    private ReservedData reserved;
 
 }
 

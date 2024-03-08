@@ -116,15 +116,10 @@ test "valid tb_client.h" {
                             else => {},
                         }
 
-                        // In C, pointers are opaque so we compare only the field sizes,
+                        // For C layout, we only care that the size/align are the same.
                         comptime var c_field_type = @TypeOf(@field(@as(c_type, undefined), field.name));
-                        switch (@typeInfo(c_field_type)) {
-                            .Pointer => |info| {
-                                comptime assert(info.size == .C);
-                                comptime assert(@sizeOf(c_field_type) == @sizeOf(field_type));
-                            },
-                            else => comptime assert(c_field_type == field_type),
-                        }
+                        comptime assert(@sizeOf(c_field_type) == @sizeOf(field_type));
+                        comptime assert(@alignOf(c_field_type) == @alignOf(field_type));
                     }
                 },
             },
