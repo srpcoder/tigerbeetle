@@ -336,6 +336,7 @@ pub fn ContextType(
             message.header.* = .{
                 .client = self.client.id,
                 .request = undefined, // Set during raw_request() below.
+                .release = undefined, // Set during raw_request() below.
                 .cluster = self.client.cluster,
                 .command = .request,
                 .operation = vsr.Operation.from(StateMachine, operation),
@@ -348,7 +349,7 @@ pub fn ContextType(
             while (batched) |p| {
                 batched = p.batch_link;
 
-                const event_data = @as([*]const u8, @ptrCast(p.data.?))[0..packet.data_size];
+                const event_data = @as([*]const u8, @ptrCast(p.data.?))[0..p.data_size];
                 stdx.copy_disjoint(.inexact, u8, message.body()[offset..], event_data);
                 offset += event_data.len;
             }
