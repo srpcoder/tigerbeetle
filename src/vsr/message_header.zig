@@ -11,13 +11,13 @@ const schema = @import("../lsm/schema.zig");
 
 const checksum_body_empty = vsr.checksum(&.{});
 
-/// Network message and journal entry header:
+/// Network message, prepare, and grid block header:
 /// We reuse the same header for both so that prepare messages from the primary can simply be
 /// journalled as is by the backups without requiring any further modification.
 pub const Header = extern struct {
     /// A checksum covering only the remainder of this header.
     /// This allows the header to be trusted without having to recv() or read() the associated body.
-    /// This checksum is enough to uniquely identify a network message or journal entry.
+    /// This checksum is enough to uniquely identify a network message or prepare.
     checksum: u128,
 
     // TODO(zig): When Zig supports u256 in extern-structs, merge this into `checksum`.
@@ -285,7 +285,7 @@ pub const Header = extern struct {
         epoch: u32 = 0,
         // NB: unlike every other message, pings and pongs use on disk view, rather than in-memory
         // view, to avoid disrupting clock synchronization while the view is being updated.
-        view: u32 = 0,
+        view: u32,
         version: u16 = vsr.Version,
         command: Command,
         replica: u8,
@@ -1107,7 +1107,8 @@ pub const Header = extern struct {
         reserved_frame: [16]u8 = [_]u8{0} ** 16,
 
         client: u128,
-        reserved: [112]u8 = [_]u8{0} ** 112,
+        reserved: [111]u8 = [_]u8{0} ** 111,
+        reason: Reason,
 
         fn invalid_header(self: *const @This()) ?[]const u8 {
             assert(self.command == .eviction);
@@ -1115,8 +1116,25 @@ pub const Header = extern struct {
             if (self.checksum_body != checksum_body_empty) return "checksum_body != expected";
             if (self.client == 0) return "client == 0";
             if (!stdx.zeroed(&self.reserved)) return "reserved != 0";
+
+            const reasons = comptime std.enums.values(Reason);
+            inline for (reasons) |reason| {
+                if (@intFromEnum(self.reason) == @intFromEnum(reason)) break;
+            } else return "reason invalid";
+            if (self.reason == .reserved) return "reason == reserved";
             return null;
         }
+
+        pub const Reason = enum(u8) {
+            reserved = 0,
+            no_session = 1,
+
+            comptime {
+                for (std.enums.values(Reason), 0..) |reason, index| {
+                    assert(@intFromEnum(reason) == index);
+                }
+            }
+        };
     };
 
     pub const RequestBlocks = extern struct {

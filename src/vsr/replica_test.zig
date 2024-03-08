@@ -3,6 +3,7 @@ const assert = std.debug.assert;
 const maybe = stdx.maybe;
 const log = std.log.scoped(.test_replica);
 const expectEqual = std.testing.expectEqual;
+const expect = std.testing.expectEqual;
 const allocator = std.testing.allocator;
 
 const stdx = @import("../stdx.zig");
@@ -11,6 +12,7 @@ const vsr = @import("../vsr.zig");
 const Process = @import("../testing/cluster/message_bus.zig").Process;
 const Message = @import("../message_pool.zig").MessagePool.Message;
 const parse_table = @import("../testing/table.zig").parse;
+const marks = @import("../testing/marks.zig");
 const StateMachineType = @import("../testing/state_machine.zig").StateMachineType;
 const Cluster = @import("../testing/cluster.zig").ClusterType(StateMachineType);
 const LinkFilter = @import("../testing/cluster/network.zig").LinkFilter;
@@ -36,7 +38,6 @@ const log_level = std.log.Level.err;
 //      causing unexpected/unaccounted-for commits. Maybe also don't tick clients at all during
 //      run(), so that new requests cannot be added "unexpectedly". (This will remove the need for
 //      the boilerplate c.request(20) == 20 at the beginning of most tests).
-// TODO Many of these would benefit from explicit code coverage marks.
 
 comptime {
     // The tests are written for these configuration values in particular.
@@ -256,8 +257,7 @@ test "Cluster: recovery: recovering_head, outdated start view" {
     try expectEqual(b1.status(), .recovering_head);
     try expectEqual(b1.op_head(), 20);
 
-    // TODO Explicit code coverage marks: This should hit the
-    // "on_start_view: ignoring (recovering_head, nonce mismatch)"
+    const mark = marks.check("ignoring (recovering_head, nonce mismatch)");
     a.stop();
     b1.replay_recorded();
     t.run();
@@ -270,6 +270,7 @@ test "Cluster: recovery: recovering_head, outdated start view" {
     t.run();
     try a.open();
     try c.request(22, 22);
+    try mark.expect_hit();
 }
 
 test "Cluster: recovery: recovering head: idle cluster" {
@@ -365,8 +366,9 @@ test "Cluster: network: partition 1-2 (isolate primary, asymmetric, send-only)" 
     try c.request(20, 20);
     t.replica(.A0).drop_all(.B1, .incoming);
     t.replica(.A0).drop_all(.B2, .incoming);
-    // TODO: Explicit coverage marks: This should hit the "primary abdicating" log line.
+    const mark = marks.check("on_commit_message_timeout: primary abdicating");
     try c.request(30, 30);
+    try mark.expect_hit();
 }
 
 test "Cluster: network: partition 1-2 (isolate primary, asymmetric, receive-only)" {
@@ -488,9 +490,9 @@ test "Cluster: repair: view-change, new-primary lagging behind checkpoint, forfe
     a0.drop_all(.__, .bidirectional);
     // Block state sync to prove that B1 recovers via WAL repair.
     b1.drop(.__, .bidirectional, .sync_checkpoint);
-    // TODO: Explicit coverage marks: B1 should hit the
-    // "on_do_view_change: lagging primary; forfeiting" log line.
+    const mark = marks.check("on_do_view_change: lagging primary; forfeiting");
     t.run();
+    try mark.expect_hit();
 
     try expectEqual(b2.role(), .primary);
     try expectEqual(b2.index(), t.replica(.A0).index());
@@ -722,11 +724,11 @@ test "Cluster: view-change: DVC, 1+1/2 faulty header stall, 2+1/3 faulty header 
     // The cluster must wait form R2 before recovering.
     try t.replica(.R0).open();
     try t.replica(.R1).open();
-    // TODO Explicit code coverage marks: This should hit the "quorum received, awaiting repair"
-    // log line in on_do_view_change().
+    const mark = marks.check("quorum received, awaiting repair");
     t.run();
     try expectEqual(t.replica(.R0).status(), .view_change);
     try expectEqual(t.replica(.R1).status(), .view_change);
+    try mark.expect_hit();
 
     // R2 provides the missing header, allowing the view-change to succeed.
     try t.replica(.R2).open();
@@ -752,10 +754,10 @@ test "Cluster: view-change: DVC, 2/3 faulty header stall" {
     t.replica(.R2).corrupt(.{ .wal_prepare = 22 });
 
     try t.replica(.R_).open();
-    // TODO Explicit code coverage marks: This should hit the "quorum received, deadlocked"
-    // log line in on_do_view_change().
+    const mark = marks.check("quorum received, deadlocked");
     t.run();
     try expectEqual(t.replica(.R_).status(), .view_change);
+    try mark.expect_hit();
 }
 
 test "Cluster: view-change: duel of the primaries" {
@@ -849,12 +851,8 @@ test "Cluster: view-change: primary with dirty log" {
     b1.corrupt(.{ .wal_prepare = checkpoint_2 % slot_count });
     t.run();
 
-    // TODO Fix https://github.com/tigerbeetle/tigerbeetle/issues/1378
-    // B1 and B2 are stuck, endlessly trying to (unnecessarily) prepare the corrupt entry.
-    try expectEqual(b1.status(), .view_change);
-    try expectEqual(b2.status(), .view_change);
-    // try expectEqual(b1.status(), .normal);
-    // try expectEqual(b2.status(), .normal);
+    try expectEqual(b1.status(), .normal);
+    try expectEqual(b2.status(), .normal);
 }
 
 test "Cluster: view-change: nack older view" {
@@ -887,12 +885,8 @@ test "Cluster: view-change: nack older view" {
     b2.pass(.R_, .incoming, .prepare);
     b2.filter(.R_, .incoming, struct {
         fn drop_message(message: *Message) bool {
-            switch (message.into_any()) {
-                .prepare => |prepare| {
-                    return (prepare.header.op < checkpoint_1_trigger + 3);
-                },
-                else => return false,
-            }
+            const prepare = message.into(.prepare) orelse return false;
+            return prepare.header.op < checkpoint_1_trigger + 3;
         }
     }.drop_message);
 
@@ -1112,6 +1106,109 @@ test "Cluster: sync: view-change with lagging replica in recovering_head" {
     try expectEqual(t.replica(.R_).op_checkpoint(), checkpoint_2);
 
     // try TestReplicas.expect_sync_done(t.replica(.R_));
+}
+
+test "Cluster: sync: slightly lagging replica" {
+    // Sometimes a replica must switch to state sync even if it is within journal_slot_count
+    // ops from commit_max. Checkpointed ops are not repaired and might become unavailable.
+
+    const t = try TestContext.init(.{ .replica_count = 3 });
+    defer t.deinit();
+
+    var c = t.clients(0, t.cluster.clients.len);
+    try c.request(checkpoint_1 - 1, checkpoint_1 - 1);
+
+    var a0 = t.replica(.A0);
+    var b1 = t.replica(.B1);
+    var b2 = t.replica(.B2);
+
+    b2.drop_all(.R_, .bidirectional);
+    try c.request(checkpoint_1_trigger + 1, checkpoint_1_trigger + 1);
+
+    // Corrupt all copies of a checkpointed prepare.
+    a0.corrupt(.{ .wal_prepare = checkpoint_1 });
+    b1.corrupt(.{ .wal_prepare = checkpoint_1 });
+    try c.request(checkpoint_1_trigger + 2, checkpoint_1_trigger + 2);
+
+    // At this point, b2 won't be able to repair WAL and must state sync.
+    b2.pass_all(.R_, .bidirectional);
+    try c.request(checkpoint_1_trigger + 3, checkpoint_1_trigger + 3);
+    try expectEqual(t.replica(.R_).commit(), checkpoint_1_trigger + 3);
+}
+
+test "Cluster: sync: checkpoint from a newer view" {
+    // B1 appends (but does not commit) prepares across a checkpoint boundary.
+    // Then the cluster truncates those prepares and commits past the checkpoint trigger.
+    // When B1 subsequently joins, it should state sync and truncate the log. Immediately
+    // after state sync, the log doesn't connect to B1's new checkpoint.
+    const t = try TestContext.init(.{ .replica_count = 6 });
+    defer t.deinit();
+
+    var c = t.clients(0, t.cluster.clients.len);
+    try c.request(checkpoint_1 - 1, checkpoint_1 - 1);
+    try expectEqual(t.replica(.R_).commit(), checkpoint_1 - 1);
+
+    var a0 = t.replica(.A0);
+    var b1 = t.replica(.B1);
+
+    {
+        // Prevent A0 from committing, prevent any other replica from becoming a primary, and
+        // only allow B1 to learn about A0 prepares.
+        t.replica(.R_).drop(.R_, .incoming, .prepare);
+        t.replica(.R_).drop(.R_, .incoming, .prepare_ok);
+        t.replica(.R_).drop(.R_, .incoming, .start_view_change);
+        b1.pass(.A0, .incoming, .prepare);
+        b1.filter(.A0, .incoming, struct {
+            // Force b1 to sync, rather than repair.
+            fn drop_message(message: *Message) bool {
+                const prepare = message.into(.prepare) orelse return false;
+                return prepare.header.op == checkpoint_1;
+            }
+        }.drop_message);
+        try c.request(checkpoint_1 + 1, checkpoint_1 - 1);
+        try expectEqual(a0.op_head(), checkpoint_1 + 1);
+        try expectEqual(b1.op_head(), checkpoint_1 + 1);
+        try expectEqual(a0.commit(), checkpoint_1 - 1);
+        try expectEqual(b1.commit(), checkpoint_1 - 1);
+    }
+
+    {
+        // Make the rest of cluster prepare and commit a different sequence of prepares.
+        t.replica(.R_).pass(.R_, .incoming, .prepare);
+        t.replica(.R_).pass(.R_, .incoming, .prepare_ok);
+        t.replica(.R_).pass(.R_, .incoming, .start_view_change);
+
+        a0.drop_all(.R_, .bidirectional);
+        b1.drop_all(.R_, .bidirectional);
+        try c.request(checkpoint_2, checkpoint_2);
+    }
+
+    {
+        // Let B1 rejoin, but prevent it from jumping into view change.
+        b1.pass_all(.R_, .bidirectional);
+        b1.drop(.R_, .bidirectional, .start_view);
+        b1.drop(.R_, .incoming, .ping);
+        b1.drop(.R_, .incoming, .pong);
+
+        const b1_view_before = b1.view();
+        var mark = marks.check("jump_sync_target: ignoring, newer view");
+        try c.request(checkpoint_2_trigger - 1, checkpoint_2_trigger - 1);
+        try expectEqual(b1_view_before, b1.view());
+        try expectEqual(b1.op_checkpoint(), 0); // B1 ignores new checkpoint.
+        try mark.expect_hit();
+
+        mark = marks.check("jump_sync_target: ignoring, newer view");
+        b1.stop(); // It should be ignored even after restart.
+        try b1.open();
+        t.run();
+        try expectEqual(b1_view_before, b1.view());
+        try expectEqual(b1.op_checkpoint(), 0);
+        try mark.expect_hit();
+    }
+
+    t.replica(.R_).pass_all(.R_, .bidirectional);
+    t.run();
+    try expectEqual(t.replica(.R_).commit(), checkpoint_2_trigger - 1);
 }
 
 test "Cluster: prepare beyond checkpoint trigger" {

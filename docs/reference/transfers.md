@@ -16,6 +16,10 @@ Transfers *cannot be modified* after creation.
 
 ## Modes
 
+Transfers can either be Single-Phase, where they are executed immediately, or Two-Phase, where
+they are first put in a Pending state and then either Posted or Voided. For more details on the
+latter, see the [Two-Phase Transfer guide](../design/two-phase-transfers.md).
+
 Fields used by each mode of transfer:
 
 | Field                         | Single-Phase | Pending  | Post-Pending | Void-Pending |
@@ -39,85 +43,6 @@ Fields used by each mode of transfer:
 | `flags.balancing_credit`      | optional     | optional | false        | false        |
 | `timestamp`                   | none         | none     | none         | none         |
 
-TigerBeetle uses the same data structures internally and
-externally. This means that sometimes you need to set temporary values
-for fields that TigerBeetle, not you (the user), are responsible.
-
-### Single-phase transfer
-
-Single-phase transfers post funds to accounts immediately when they are created.
-
-### Two-phase transfer
-
-A pending transfer followed by a post-pending transfer, void-pending transfer, or a timeout is
-called a "two-phase transfer". Unlike a single-phase transfer, a two-phase transfer moves funds in
-stages:
-
-1. Reserve funds
-2. Resolve funds (post, void, or timeout)
-
-Attempting to resolve a pending transfer more than once will return the applicable error result:
-- [`pending_transfer_already_posted`](../reference/operations/create_transfers.md#pending_transfer_already_posted)
-- [`pending_transfer_already_voided`](../reference/operations/create_transfers.md#pending_transfer_already_voided)
-- [`pending_transfer_expired`](../reference/operations/create_transfers.md#pending_transfer_expired)
-
-#### Pending transfer
-
-A pending transfer, denoted by [`flags.pending`](#flagspending),
-reserves its `amount` in the debit/credit accounts'
-[`debits_pending`](./accounts.md#debits_pending)/[`credits_pending`](./accounts.md#credits_pending)
-fields respectively, leaving `debits_posted`/`credits_posted` unmodified.
-
-#### Post-pending transfer
-
-A post-pending transfer, denoted by [`flags.post_pending_transfer`](#flagspost_pending_transfer),
-causes the corresponding pending transfer (referenced by [`pending_id`](#pending_id)) to "post",
-transferring some or all of the pending transfer's reserved amount to its destination, and restoring
-(voiding) the remainder (if any) to its origin accounts.
-
-* If the posted `amount` is 0, the full pending transfer's amount is
-  posted.
-* If the posted `amount` is nonzero, then only this amount is posted,
-  and the remainder is restored to its original accounts. It must be
-  less than or equal to the pending transfer's amount.
-
-Additionally, when `flags.post_pending_transfer` is set:
-
-* `pending_id` must reference a [pending transfer](#pending-transfer).
-* `flags.void_pending_transfer` must not be set.
-
-And the following fields may either be zero, otherwise must match the
-value of the pending transfer's field:
-
-* `debit_account_id`
-* `credit_account_id`
-* `ledger`
-* `code`
-
-#### Void-pending transfer
-
-A void-pending transfer, denoted by [`flags.void_pending_transfer`](#flagsvoid_pending_transfer),
-causes the pending transfer (referenced by [`pending_id`](#pending_id)) to void. The pending amount
-is restored to its original accounts.
-Additionally, when this field is set:
-
-* `pending_id` must reference a [pending transfer](#pending-transfer).
-* `flags.post_pending_transfer` must not be set.
-
-And the following fields may either be zero, otherwise must match the
-value of the pending transfer's field:
-
-* `debit_account_id`
-* `credit_account_id`
-* `amount`
-* `ledger`
-* `code`
-
-#### Read more
-
-See the [Two-phase transfers](../design/two-phase-transfers.md) guide
-for details, examples, and sample code.
-
 ## Fields
 
 ### `id`
@@ -132,6 +57,9 @@ Constraints:
 * Type is 128-bit unsigned integer (16 bytes)
 * Must not be zero or `2^128 - 1`
 * Must not conflict with another transfer
+
+See the [`id` section in the data modeling doc](../design/data-modeling.md#id) for more
+recommendations on choosing an ID scheme.
 
 ### `debit_account_id`
 
@@ -205,10 +133,7 @@ If this transfer will post or void a pending transfer, `pending_id`
 references that pending transfer. If this is not a post or void
 transfer, it must be zero.
 
-See also:
-* [Pending Transfer](#pending-transfer)
-* [Post-Pending Transfer](#post-pending-transfer)
-* [Void-Pending Transfer](#void-pending-transfer)
+See the section on [Two-Phase Transfers](../design/two-phase-transfers.md) for more information on how the `pending_id` is used.
 
 Constraints:
 
@@ -272,15 +197,19 @@ Constraints:
 * Type is 32-bit unsigned integer (4 bytes)
 * Must be zero if `flags.pending` is *not* set
 
+The `timeout` is an interval in seconds rather than an absolute timestamp
+because this is more robust to clock skew between the cluster and the
+application. (Watch this talk on
+[Detecting Clock Sync Failure in Highly Available Systems](https://youtu.be/7R-Iz6sJG6Q?si=9sD2TpfD29AxUjOY)
+on YouTube for more details.)
+
 ### `ledger`
 
 This is an identifier that partitions the sets of accounts that can
-transact with each other. Put another way, money cannot transfer
-between two accounts with different `ledger` values. See:
-[`accounts_must_have_the_same_ledger`](./operations/create_transfers.md#accounts_must_have_the_same_ledger).
+transact with each other.
 
-[Currency exchange](../recipes/currency-exchange.md) is implemented with two or more linked
-transfers.
+See [data modeling](../design/data-modeling.md#ledger) for more details
+about how to think about setting up your ledgers.
 
 Constraints:
 
@@ -325,7 +254,8 @@ transfer in the batch, to create a chain of transfers, of arbitrary
 length, which all succeed or fail in creation together. The tail of a
 chain is denoted by the first transfer without this flag. The last
 transfer in a batch may therefore never have `flags.linked` set as
-this would leave a chain open-ended (see `linked_event_chain_open`).
+this would leave a chain open-ended (see
+[`linked_event_chain_open`](./operations/create_transfers.md#linked_event_chain_open)).
 
 Multiple chains of individual transfers may coexist within a batch to
 succeed or fail independently. Transfers within a chain are executed
@@ -354,9 +284,12 @@ then `B`, `C`, and `D` will all fail. They are linked.
 Transfers `A` and `E` fail or succeed independently of `B`, `C`, `D`,
 and each other.
 
-After the link has executed, the association of each event is lost.
-To save the association, it must be
-[encoded into the data model](../design/data-modeling.md).
+After the chain of linked transfers has executed, the fact that they were
+linked will not be saved.
+To save the association between transfers, it must be
+[encoded into the data model](../design/data-modeling.md), for example by
+adding an ID to one of the [user data](../design/data-modeling.md#user_data)
+fields.
 
 ##### Examples
 
@@ -364,15 +297,15 @@ To save the association, it must be
 
 #### `flags.pending`
 
-Mark the transfer as a [pending transfer](#pending-transfer).
+Mark the transfer as a [pending transfer](../design/two-phase-transfers.md#reserve-funds-pending-transfer).
 
 #### `flags.post_pending_transfer`
 
-Mark the transfer as a [post-pending transfer](#post-pending-transfer).
+Mark the transfer as a [post-pending transfer](../design/two-phase-transfers.md#post-pending-transfer).
 
 #### `flags.void_pending_transfer`
 
-Mark the transfer as a [void-pending transfer](#void-pending-transfer).
+Mark the transfer as a [void-pending transfer](../design/two-phase-transfers.md#void-pending-transfer).
 
 #### `flags.balancing_debit`
 
@@ -432,17 +365,12 @@ UNIX epoch.
 It is set by TigerBeetle to the moment the transfer arrives at
 the cluster.
 
-Additionally, all timestamps are unique, immutable and [totally
-ordered](http://book.mixu.net/distsys/time.html). So a transfer that
-is created before another transfer is guaranteed to have an earlier
-timestamp. In other systems this is also called a "physical"
-timestamp, "ingestion" timestamp, "record" timestamp, or "system"
-timestamp.
+You can read more about [Time in TigerBeetle](../design/time.md).
 
 Constraints:
 
-* Type is 64-bit unsigned integer (8 bytes)
-* User sets to zero on creation
+- Type is 64-bit unsigned integer (8 bytes)
+- Must be set to `0` by the user when the `Transfer` is created
 
 ## Internals
 

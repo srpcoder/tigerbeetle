@@ -1,5 +1,128 @@
 # TigerBeetle Changelog
 
+## 2024-03-04
+
+### Safety And Performance
+
+- [#1584](https://github.com/tigerbeetle/tigerbeetle/pull/1584)
+  Lower our memory usage by removing a redundant stash and not requiring a non-zero object cache
+  size for Grooves.
+
+  The object cache is designed to help things like Account lookups, where the positive case can
+  skip all the prefetch machinery, but it doesn't make as much sense for other Grooves.
+
+- [#1581](https://github.com/tigerbeetle/tigerbeetle/pull/1581)
+  [#1611](https://github.com/tigerbeetle/tigerbeetle/pull/1611)
+
+  Hook [nyrkiö](https://nyrkio.com/) up to our CI! You can find our dashboard
+  [here](https://nyrkio.com/public/https%3A%2F%2Fgithub.com%2Ftigerbeetle%2Ftigerbeetle/main/devhub)
+  in addition to our [devhub](https://tigerbeetle.github.io/tigerbeetle/).
+
+- [#1635](https://github.com/tigerbeetle/tigerbeetle/pull/1635)
+  [#1634](https://github.com/tigerbeetle/tigerbeetle/pull/1634)
+  [#1623](https://github.com/tigerbeetle/tigerbeetle/pull/1623)
+  [#1619](https://github.com/tigerbeetle/tigerbeetle/pull/1619)
+  [#1609](https://github.com/tigerbeetle/tigerbeetle/pull/1609)
+  [#1608](https://github.com/tigerbeetle/tigerbeetle/pull/1608)
+  [#1595](https://github.com/tigerbeetle/tigerbeetle/pull/1595)
+
+  Lots of small VSR changes, including a VOPR crash fix.
+
+- [#1598](https://github.com/tigerbeetle/tigerbeetle/pull/1598)
+
+  Fix a VOPR failure where state sync would cause a break in the hash chain.
+
+### Internals
+
+- [#1599](https://github.com/tigerbeetle/tigerbeetle/pull/1599)
+  [#1597](https://github.com/tigerbeetle/tigerbeetle/pull/1597)
+
+  Use Expand-Archive over unzip in PowerShell - thanks @felipevalerio for reporting!
+
+- [#1607](https://github.com/tigerbeetle/tigerbeetle/pull/1607)
+  [#1620](https://github.com/tigerbeetle/tigerbeetle/pull/1620)
+
+  Implement [explicit coverage marks](https://ferrous-systems.com/blog/coverage-marks/).
+
+- [#1621](https://github.com/tigerbeetle/tigerbeetle/pull/1621)
+  [#1625](https://github.com/tigerbeetle/tigerbeetle/pull/1625)
+  [#1622](https://github.com/tigerbeetle/tigerbeetle/pull/1622)
+  [#1600](https://github.com/tigerbeetle/tigerbeetle/pull/1600)
+  [#1605](https://github.com/tigerbeetle/tigerbeetle/pull/1605)
+  [#1618](https://github.com/tigerbeetle/tigerbeetle/pull/1618)
+  [#1606](https://github.com/tigerbeetle/tigerbeetle/pull/1606)
+
+  Minor doc fixups.
+
+- [#1636](https://github.com/tigerbeetle/tigerbeetle/pull/1636)
+  [#1626](https://github.com/tigerbeetle/tigerbeetle/pull/1626)
+
+  Default the VOPR to short log, and fix a false assertion in the liveness checker.
+
+- [#1596](https://github.com/tigerbeetle/tigerbeetle/pull/1596)
+
+  Fix a memory leak in our Java tests.
+
+### TigerTracks 🎧
+
+- [Auffe aufn Berg](https://www.youtube.com/watch?v=eRbkRNaqy9Y)
+
+## 2024-02-26
+
+### Safety And Performance
+
+- [#1591](https://github.com/tigerbeetle/tigerbeetle/pull/1591)
+  [#1589](https://github.com/tigerbeetle/tigerbeetle/pull/1589)
+  [#1579](https://github.com/tigerbeetle/tigerbeetle/pull/1579)
+  [#1576](https://github.com/tigerbeetle/tigerbeetle/pull/1576)
+
+  Rework the log repair logic to never repair beyond a "confirmed" checkpoint, fixing a
+  [liveness issue](https://github.com/tigerbeetle/tigerbeetle/issues/1378) where it was impossible
+  for the primary to repair its entire log, even with a quorum of replicas at a recent checkpoint.
+
+- [#1572](https://github.com/tigerbeetle/tigerbeetle/pull/1572)
+
+  Some Java unit tests created native client instances without the proper deinitialization,
+  causing an `OutOfMemoryError` during CI.
+
+- [#1569](https://github.com/tigerbeetle/tigerbeetle/pull/1569)
+  [#1570](https://github.com/tigerbeetle/tigerbeetle/pull/1570)
+
+  Fix Vopr's false alarms.
+
+### Internals
+
+- [#1585](https://github.com/tigerbeetle/tigerbeetle/pull/1585)
+
+  Document how assertions should be used, especially those with complexity _O(n)_ under
+  the `constants.verify` conditional.
+
+- [#1580](https://github.com/tigerbeetle/tigerbeetle/pull/1580)
+
+  Harmonize and automate the logging pattern by using the `@src` built-in to retrieve the
+  function name.
+
+- [#1568](https://github.com/tigerbeetle/tigerbeetle/pull/1568)
+
+  Include the benchmark smoke as part of the `zig build test` command rather than a special case
+  during CI.
+
+- [#1574](https://github.com/tigerbeetle/tigerbeetle/pull/1574)
+
+  Remove unused code coverage metrics from the CI.
+
+- [#1575](https://github.com/tigerbeetle/tigerbeetle/pull/1575)
+  [#1573](https://github.com/tigerbeetle/tigerbeetle/pull/1573)
+  [#1582](https://github.com/tigerbeetle/tigerbeetle/pull/1582)
+
+  Re-enable Windows CI 🎉.
+
+### TigerTracks 🎧
+
+- [Dos Margaritas](https://www.youtube.com/watch?v=Ts_7BYubYws)
+
+  [(_versión en español_)](https://www.youtube.com/watch?v=B_VLegyguoI)
+
 ## 2024-02-19
 
 ### Safety And Performance

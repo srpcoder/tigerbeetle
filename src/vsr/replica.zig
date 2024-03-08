@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const maybe = stdx.maybe;
+const SourceLocation = std.builtin.SourceLocation;
 
 const constants = @import("../constants.zig");
 const stdx = @import("../stdx.zig");
@@ -17,6 +18,7 @@ const RingBuffer = @import("../ring_buffer.zig").RingBuffer;
 const ForestTableIteratorType =
     @import("../lsm/forest_table_iterator.zig").ForestTableIteratorType;
 const TestStorage = @import("../testing/storage.zig").Storage;
+const marks = @import("../testing/marks.zig");
 
 const vsr = @import("../vsr.zig");
 const Header = vsr.Header;
@@ -28,7 +30,7 @@ const SyncStage = vsr.SyncStage;
 const SyncTarget = vsr.SyncTarget;
 const ClientSessions = vsr.ClientSessions;
 
-const log = stdx.log.scoped(.replica);
+const log = marks.wrap_log(stdx.log.scoped(.replica));
 const tracer = @import("../tracer.zig");
 
 pub const Status = enum {
@@ -198,7 +200,7 @@ pub fn ReplicaType(
         /// A distributed fault-tolerant clock for lower and upper bounds on the primary's wall clock:
         clock: Clock,
 
-        /// The persistent log of hash-chained journal entries:
+        /// The persistent log of hash-chained prepares:
         journal: Journal,
 
         /// ClientSessions records for each client the latest session and the latest committed reply.
@@ -784,7 +786,7 @@ pub fn ReplicaType(
 
             if (self.solo()) {
                 if (self.commit_min < self.op) {
-                    self.advance_commit_max(self.op, @src().fn_name);
+                    self.advance_commit_max(self.op, @src());
                     self.commit_journal();
 
                     // Recovery will complete when commit_journal finishes.
@@ -1160,10 +1162,10 @@ pub fn ReplicaType(
             // Switch on the header type so that we don't log opaque bytes for the per-command data.
             switch (message.header.into_any()) {
                 inline else => |header| {
-                    log.debug("{}: on_message: view={} status={} {}", .{
+                    log.debug("{}: on_message: view={} status={s} {}", .{
                         self.replica,
                         self.view,
-                        self.status,
+                        @tagName(self.status),
                         header,
                     });
                 },
@@ -1395,7 +1397,7 @@ pub fn ReplicaType(
             assert(message.header.op > self.commit_min);
 
             if (self.backup()) {
-                self.advance_commit_max(message.header.commit, @src().fn_name);
+                self.advance_commit_max(message.header.commit, @src());
                 assert(self.commit_max >= message.header.commit);
             }
             defer if (self.backup()) self.commit_journal();
@@ -1457,6 +1459,7 @@ pub fn ReplicaType(
             });
             assert(message.header.op == self.op + 1);
             assert(message.header.op <= self.op_prepare_max());
+            assert(message.header.op - self.op_repair_min() < constants.journal_slot_count);
             self.op = message.header.op;
             self.journal.set_header_as_dirty(message.header);
 
@@ -1628,7 +1631,7 @@ pub fn ReplicaType(
             if (self.journal.header_with_op(message.header.commit)) |commit_entry| {
                 if (commit_entry.checksum == message.header.commit_checksum) {
                     log.debug("{}: on_commit: checksum verified", .{self.replica});
-                } else if (self.valid_hash_chain("on_commit")) {
+                } else if (self.valid_hash_chain(@src())) {
                     @panic("commit checksum verification failed");
                 } else {
                     // We may still be repairing after receiving the start_view message.
@@ -1636,7 +1639,7 @@ pub fn ReplicaType(
                 }
             }
 
-            self.advance_commit_max(message.header.commit, @src().fn_name);
+            self.advance_commit_max(message.header.commit, @src());
             self.commit_journal();
         }
 
@@ -1787,25 +1790,25 @@ pub fn ReplicaType(
             );
             const op_head = switch (headers) {
                 .awaiting_quorum => {
-                    log.debug("{}: on_do_view_change: view={} waiting for quorum", .{
-                        self.replica,
-                        self.view,
-                    });
+                    log.debug(
+                        "{}: on_do_view_change: view={} waiting for quorum",
+                        .{ self.replica, self.view },
+                    );
                     return;
                 },
                 .awaiting_repair => {
-                    log.warn("{}: on_do_view_change: view={} quorum received, awaiting repair", .{
-                        self.replica,
-                        self.view,
-                    });
+                    log.mark.warn(
+                        "{}: on_do_view_change: view={} quorum received, awaiting repair",
+                        .{ self.replica, self.view },
+                    );
                     self.primary_log_do_view_change_quorum("on_do_view_change");
                     return;
                 },
                 .complete_invalid => {
-                    log.err("{}: on_do_view_change: view={} quorum received, deadlocked", .{
-                        self.replica,
-                        self.view,
-                    });
+                    log.mark.err(
+                        "{}: on_do_view_change: view={} quorum received, deadlocked",
+                        .{ self.replica, self.view },
+                    );
                     self.primary_log_do_view_change_quorum("on_do_view_change");
                     return;
                 },
@@ -1856,7 +1859,7 @@ pub fn ReplicaType(
                     }
                 } else unreachable;
 
-                log.debug("{}: on_do_view_change: lagging primary; forfeiting " ++
+                log.mark.debug("{}: on_do_view_change: lagging primary; forfeiting " ++
                     "(view={}..{} checkpoint={}..{})", .{
                     self.replica,
                     self.view,
@@ -1950,7 +1953,7 @@ pub fn ReplicaType(
                     if (self.log_view < self.view or
                         (self.log_view == self.view and header.op >= self.op))
                     {
-                        self.set_op_and_commit_max(header.op, message.header.commit, "on_start_view");
+                        self.set_op_and_commit_max(header.op, message.header.commit, @src());
                         assert(self.op == header.op);
                         assert(self.commit_max >= message.header.commit);
                         break;
@@ -2662,7 +2665,7 @@ pub fn ReplicaType(
                 assert(self.pipeline.queue.prepare_queue.count > 0);
                 assert(self.primary_pipeline_pending() != null);
 
-                log.debug("{}: on_commit_message_timeout: primary abdicating (view={})", .{
+                log.mark.debug("{}: on_commit_message_timeout: primary abdicating (view={})", .{
                     self.replica,
                     self.view,
                 });
@@ -2802,25 +2805,13 @@ pub fn ReplicaType(
             if (self.sync_target_max.?.checkpoint_op <= self.op_checkpoint()) return;
 
             {
-                // commit_max is the highest committed op *within our view*.
-                // But due to our sync target (from pings), we might know that the cluster is even
-                // farther ahead in a view that we have not joined.
-                const primary_commit_max =
-                    @max(self.commit_max, self.sync_target_max.?.checkpoint_op);
-                const primary_repair_min = (primary_commit_max +
-                    constants.pipeline_prepare_queue_max) -|
-                    (constants.journal_slot_count - 1);
-
                 const commit_next = self.commit_min + 1;
                 const commit_next_slot = self.journal.slot_with_op(commit_next);
 
                 // "stuck" is not actually certain, merely likely (see below).
-                const stuck_header =
-                    commit_next < primary_repair_min and
-                    !self.valid_hash_chain("repair_sync_timeout");
+                const stuck_header = !self.valid_hash_chain(@src());
 
                 const stuck_prepare =
-                    commit_next < primary_repair_min and
                     (commit_next_slot == null or self.journal.dirty.bit(commit_next_slot.?));
 
                 const stuck_grid = !self.grid.read_global_queue.empty();
@@ -2829,11 +2820,11 @@ pub fn ReplicaType(
             }
 
             // At this point:
-            // - we know we are lagging behind the cluster by at least a checkpoint, and
-            // - our next commit may not be repairable, and
+            // - we know that the cluster committed atop of a future a checkpoint, and
             // - we have not made any progress committing for some interval.
-            // It is possible that we could in fact repair and progress anyway, but usually
-            // we are stuck waiting for a prepare or block which will never arrive.
+            // It is possible that we could in fact repair and progress anyway, but this is not
+            // guaranteed: the rest of the cluster no longer repairs the relevant prepares.
+            // We might be stuck waiting for a prepare or block which will never arrive.
 
             log.warn("{}: on_repair_sync_timeout: start sync; lagging behind cluster " ++
                 "(op_head={} commit_min={} commit_max={} commit_stage={s})", .{
@@ -3018,7 +3009,7 @@ pub fn ReplicaType(
         /// Caller must ensure that:
         /// - op=commit is indeed committed by the cluster,
         /// - local WAL doesn't contain truncated prepares from finished views.
-        fn advance_commit_max(self: *Self, commit: u64, method: []const u8) void {
+        fn advance_commit_max(self: *Self, commit: u64, source: SourceLocation) void {
             defer {
                 assert(self.commit_max >= commit);
                 assert(self.commit_max >= self.commit_min);
@@ -3032,7 +3023,7 @@ pub fn ReplicaType(
             if (commit > self.commit_max) {
                 log.debug("{}: {s}: advancing commit_max={}..{}", .{
                     self.replica,
-                    method,
+                    source.fn_name,
                     self.commit_max,
                     commit,
                 });
@@ -3236,7 +3227,7 @@ pub fn ReplicaType(
             assert(self.commit_min <= self.op);
             maybe(self.commit_max <= self.op);
 
-            if (!self.valid_hash_chain("commit_journal_next")) {
+            if (!self.valid_hash_chain(@src())) {
                 assert(!self.solo());
                 self.commit_dispatch(.idle);
                 return;
@@ -3789,7 +3780,7 @@ pub fn ReplicaType(
 
             self.commit_min += 1;
             assert(self.commit_min == prepare.header.op);
-            self.advance_commit_max(self.commit_min, @src().fn_name);
+            self.advance_commit_max(self.commit_min, @src());
 
             if (self.event_callback) |hook| hook(self, .committed);
 
@@ -4093,7 +4084,7 @@ pub fn ReplicaType(
             assert(self.primary_index(self.view) == self.replica);
             assert(self.repairs_allowed());
 
-            assert(self.valid_hash_chain("primary_discard_uncommitted_ops_from"));
+            assert(self.valid_hash_chain(@src()));
 
             const slot = self.journal.slot_with_op(op).?;
             assert(op > self.commit_max);
@@ -4437,7 +4428,7 @@ pub fn ReplicaType(
                 // partitioned and don't yet know about a session. We solve this by having clients
                 // include the view number and rejecting messages from clients with newer views.
                 log.err("{}: on_request: no session", .{self.replica});
-                self.send_eviction_message_to_client(message.header.client);
+                self.send_eviction_message_to_client(message.header.client, .no_session);
                 return true;
             }
         }
@@ -4684,7 +4675,7 @@ pub fn ReplicaType(
                             // This SV is guaranteed to have originated after the replica crash,
                             // it is safe to use to determine the head op.
                         } else {
-                            log.debug("{}: on_{s}: ignoring (recovering_head, nonce mismatch)", .{
+                            log.mark.debug("{}: on_{s}: ignoring (recovering_head, nonce mismatch)", .{
                                 self.replica,
                                 command,
                             });
@@ -4952,7 +4943,8 @@ pub fn ReplicaType(
         fn op_head_certain(self: *const Self) bool {
             assert(self.status == .recovering);
 
-            // "op-head < op-checkpoint" is possible if op_checkpoint…head (inclusive) is corrupt.
+            // "op-head < op-checkpoint" is possible if op_checkpoint…head (inclusive) is corrupt or
+            // if the replica restarts after state sync updates superblock.
             if (self.op < self.op_checkpoint()) return false;
 
             const slot_op_checkpoint = self.journal.slot_for_op(self.op_checkpoint());
@@ -5057,21 +5049,15 @@ pub fn ReplicaType(
         }
 
         /// Returns the oldest op that the replica must/(is permitted to) repair.
-        /// The goal is to repair as much as possible without triggering unnecessary state sync.
         ///
-        /// - Repairing uncommitted ops is necessary as primary — we will need them to proceed.
-        /// - Repairing committed + not-yet-checkpointed ops is useful because we might crash,
-        ///   in which case we will need them to recover.
-        /// - Repairing committed + checkpointed ops:
-        ///   - backups don't repair checkpointed ops because:
-        ///     - repairing an op from the previous checkpoint might "clean" a slot which belongs
-        ///       to a corrupt entry from the current WAL-wrap, leading to the backup incorrectly
-        ///       nacking the latter entry.
-        ///     - there is no guarantee that they will ever be available (if our head is behind),
-        ///       and we don't want to stall the new view startup.
-        ///   - primaries do repair checkpointed ops so that they can help lagging backups catch up,
-        ///     as long as the op is new enough to be present in the WAL of some other replica and
-        ///     is from the previous checkpoint.
+        /// Safety condition: repairing an old op must not overwrite a newer op from the next wrap.
+        ///
+        /// Availability condition: each committed op must be present either in a quorum of WALs or
+        /// it in a quorum of checkpoints.
+        ///
+        /// If op=trigger+1 is committed, the corresponding checkpoint is durably present on
+        /// a quorum of replicas. Repairing all ops since the latest durable checkpoint satisfies
+        /// both conditions.
         ///
         /// When called from status=recovering_head or status=recovering, the caller is responsible
         /// for ensuring that replica.op is valid.
@@ -5081,54 +5067,33 @@ pub fn ReplicaType(
             assert(self.op <= self.op_prepare_max());
             assert(self.commit_max >= self.op -| constants.pipeline_prepare_queue_max);
 
-            const op = op: {
-                if (self.primary_index(self.view) == self.replica) {
-                    assert(self.status == .normal or self.do_view_change_quorum or self.solo());
-                    // This is the oldest op that is guaranteed to be in the WALs of any replica.
-                    // (Assuming that this primary has not been superseded.)
-                    const op_wal_oldest = @min(
-                        // Add the oldest pipeline_prepare_queue_max ops because they may have been
-                        // newer ops which were then truncated by a view-change, causing the head op
-                        // to backtrack.
-                        self.op + constants.pipeline_prepare_queue_max,
-                        // ...But the pipeline messages could not have moved past the next
-                        // checkpoint's op_prepare_max.
-                        self.op_prepare_max(),
-                    ) -| (constants.journal_slot_count - 1);
+            const repair_min = repair_min: {
+                if (self.op_checkpoint() == 0) {
+                    break :repair_min 0;
+                }
 
-                    // We know checkpoint ids for the previous checkpoint and the one before that.
-                    // Don't try repairing ops with older checkpoint_ids which are impossible to
-                    // verify.
-                    const op_with_checkpoint_id_oldest =
-                        (self.op_checkpoint() + 1) -| constants.vsr_checkpoint_interval;
-                    assert(self.checkpoint_id_for_op(op_with_checkpoint_id_oldest) != null);
-
-                    if (op_with_checkpoint_id_oldest > 0) {
-                        assert(self.checkpoint_id_for_op(op_with_checkpoint_id_oldest - 1) == null);
-                    }
-
-                    break :op @max(op_wal_oldest, op_with_checkpoint_id_oldest);
-                } else {
-                    // Strictly speaking a backup only needs to repair commit_min+1… to proceed.
-                    // However, if the backup crashes and recovers, it will need to replay ops
-                    // from the checkpoint, so we repair slightly more.
-                    if (self.op_checkpoint() == self.op) {
+                const op_checkpoint_trigger =
+                    vsr.Checkpoint.trigger_for_checkpoint(self.op_checkpoint()).?;
+                // After state sync, commit_max might lag behind checkpoint_op.
+                maybe(self.commit_max < op_checkpoint_trigger);
+                if (self.commit_max > op_checkpoint_trigger) {
+                    if (self.op == self.op_checkpoint()) {
                         // Don't allow "op_repair_min > op_head".
-                        break :op self.op_checkpoint();
-                    } else {
-                        // +1 because the primary (and other replicas) may overwrite op_checkpoint.
-                        // And we don't need op_checkpoint's prepare/header in our log if we crash.
-                        break :op self.op_checkpoint() + 1;
+                        break :repair_min self.op_checkpoint();
                     }
+                    break :repair_min self.op_checkpoint() + 1;
+                } else {
+                    break :repair_min (self.op_checkpoint() + 1) -|
+                        constants.vsr_checkpoint_interval;
                 }
             };
 
-            assert(op <= self.op);
-            assert(op <= self.commit_min + 1);
-            assert(op <= self.op_checkpoint() + 1);
-            assert(self.op - op < constants.journal_slot_count);
-            assert(self.checkpoint_id_for_op(op) != null);
-            return op;
+            assert(repair_min <= self.op);
+            assert(repair_min <= self.commit_min + 1);
+            assert(repair_min <= self.op_checkpoint() + 1);
+            assert(self.op - repair_min < constants.journal_slot_count);
+            assert(self.checkpoint_id_for_op(repair_min) != null);
+            return repair_min;
         }
 
         /// The replica repairs backwards from `commit_max`. But if `commit_max` is too high
@@ -5558,10 +5523,10 @@ pub fn ReplicaType(
 
             if (header.op < self.op_repair_min()) {
                 // Slots too far back belong to the next wrap of the log.
-                log.debug("{}: repair_header: false (precedes op_repair_min={})", .{
-                    self.replica,
-                    self.op_repair_min(),
-                });
+                log.debug(
+                    "{}: repair_header: op={} checksum={} (precedes op_repair_min={})",
+                    .{ self.replica, header.op, header.checksum, self.op_repair_min() },
+                );
                 return false;
             }
 
@@ -6457,13 +6422,18 @@ pub fn ReplicaType(
             }
         }
 
-        fn send_eviction_message_to_client(self: *Self, client: u128) void {
+        fn send_eviction_message_to_client(
+            self: *Self,
+            client: u128,
+            reason: vsr.Header.Eviction.Reason,
+        ) void {
             assert(self.status == .normal);
             assert(self.primary());
 
-            log.err("{}: too many sessions, sending eviction message to client={}", .{
+            log.err("{}: sending eviction message to client={} reason={s}", .{
                 self.replica,
                 client,
+                @tagName(reason),
             });
 
             self.send_header_to_client(client, @bitCast(Header.Eviction{
@@ -6472,6 +6442,7 @@ pub fn ReplicaType(
                 .replica = self.replica,
                 .view = self.view,
                 .client = client,
+                .reason = reason,
             }));
         }
 
@@ -6970,7 +6941,7 @@ pub fn ReplicaType(
             }
         }
 
-        fn set_op_and_commit_max(self: *Self, op: u64, commit_max: u64, method: []const u8) void {
+        fn set_op_and_commit_max(self: *Self, op: u64, commit_max: u64, source: SourceLocation) void {
             assert(self.status == .view_change or self.status == .normal or
                 self.status == .recovering_head);
 
@@ -6994,7 +6965,7 @@ pub fn ReplicaType(
             if (commit_max < self.commit_max and self.commit_min == self.commit_max) {
                 log.debug("{}: {s}: k={} < commit_max={} and commit_min == commit_max", .{
                     self.replica,
-                    method,
+                    source.fn_name,
                     commit_max,
                     self.commit_max,
                 });
@@ -7018,7 +6989,7 @@ pub fn ReplicaType(
 
             log.debug("{}: {s}: view={} op={}..{} commit={}..{}", .{
                 self.replica,
-                method,
+                source.fn_name,
                 self.view,
                 previous_op,
                 self.op,
@@ -7114,7 +7085,7 @@ pub fn ReplicaType(
                 // "`replica.op` exists" invariant may be broken briefly between
                 // set_op_and_commit_max() and replace_header().
 
-                self.set_op_and_commit_max(header_head.op, commit_max, "on_do_view_change");
+                self.set_op_and_commit_max(header_head.op, commit_max, @src());
                 assert(self.commit_max <= self.op_prepare_max());
                 assert(self.commit_max <= self.op);
                 maybe(self.journal.header_with_op(self.op) == null);
@@ -8002,7 +7973,7 @@ pub fn ReplicaType(
 
             // Bump commit_max before the superblock update so that a view_durable_update()
             // during the sync_start update uses the correct (new) commit_max.
-            self.advance_commit_max(stage.target.checkpoint_op, @src().fn_name);
+            self.advance_commit_max(stage.target.checkpoint_op, @src());
 
             const sync_op_max =
                 vsr.Checkpoint.trigger_for_checkpoint(stage.target.checkpoint_op).?;
@@ -8059,7 +8030,8 @@ pub fn ReplicaType(
             ));
 
             self.commit_min = self.superblock.working.vsr_state.checkpoint.commit_min;
-            if (self.op < self.commit_min) {
+            assert(self.commit_min == self.op_checkpoint());
+            if (self.op < self.op_checkpoint()) {
                 self.transition_to_recovering_head();
             }
 
@@ -8201,7 +8173,7 @@ pub fn ReplicaType(
         /// Whether it is safe to commit or send prepare_ok messages.
         /// Returns true if the hash chain is valid and up to date for the current view.
         /// This is a stronger guarantee than `valid_hash_chain_between()` below.
-        fn valid_hash_chain(self: *Self, method: []const u8) bool {
+        fn valid_hash_chain(self: *Self, source: SourceLocation) bool {
             assert(self.op_checkpoint() <= self.commit_min);
             assert(self.op_checkpoint() <= self.op);
 
@@ -8210,7 +8182,7 @@ pub fn ReplicaType(
             if (self.op < self.op_repair_max()) {
                 log.debug("{}: {s}: waiting for repair (op={} < op_repair_max={}, commit_max={})", .{
                     self.replica,
-                    method,
+                    source.fn_name,
                     self.op,
                     self.op_repair_max(),
                     self.commit_max,
@@ -8227,7 +8199,7 @@ pub fn ReplicaType(
                 // in our journal yet.
                 log.debug("{}: {s}: recently synced; waiting for ops (op=checkpoint={})", .{
                     self.replica,
-                    method,
+                    source.fn_name,
                     self.op,
                 });
                 return false;
@@ -8239,7 +8211,7 @@ pub fn ReplicaType(
 
             // We must validate the hash chain as far as possible, since `self.op` may disclose a fork:
             if (!self.valid_hash_chain_between(op_verify_min, self.op)) {
-                log.debug("{}: {s}: waiting for repair (hash chain)", .{ self.replica, method });
+                log.debug("{}: {s}: waiting for repair (hash chain)", .{ self.replica, source.fn_name });
                 return false;
             }
 
@@ -8403,6 +8375,7 @@ pub fn ReplicaType(
                 inline .commit, .ping => |h| .{
                     .checkpoint_id = h.checkpoint_id,
                     .checkpoint_op = h.checkpoint_op,
+                    .view = h.view,
                 },
                 else => return,
             };
@@ -8421,6 +8394,18 @@ pub fn ReplicaType(
 
                 // Either this replica, the header's replica, or both, have diverged.
                 @panic("checkpoint diverged");
+            }
+
+            if (candidate.view > self.view_durable()) {
+                log.mark.debug("{}: on_{s}: jump_sync_target: ignoring, newer view" ++
+                    " (view={} view_durable={} candidate.view={})", .{
+                    self.replica,
+                    @tagName(header.command),
+                    self.view,
+                    self.view_durable(),
+                    candidate.view,
+                });
+                return;
             }
 
             // Don't sync backwards, or to our current checkpoint.

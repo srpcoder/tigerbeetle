@@ -38,13 +38,13 @@ pub const std_options = struct {
     /// "full" mode is the usual logging according to the level.
     pub const log_level: std.log.Level = if (vsr_simulator_options.log == .short) .info else .debug;
     pub const logFn = log_override;
-};
 
-// Uncomment if you need per-scope control over the log levels.
-// pub const scope_levels = [_]std.log.ScopeLevel{
-//     .{ .scope = .cluster, .level = .info },
-//     .{ .scope = .replica, .level = .debug },
-// };
+    // Uncomment if you need per-scope control over the log levels.
+    // pub const log_scope_levels: []const std.log.ScopeLevel = &.{
+    //     .{ .scope = .cluster, .level = .info },
+    //     .{ .scope = .replica, .level = .debug },
+    // };
+};
 
 pub const tigerbeetle_config = @import("config.zig").configs.test_min;
 
@@ -521,8 +521,7 @@ pub const Simulator = struct {
         if (core_recovering_head == 0) return false;
 
         const quorums = vsr.quorums(simulator.options.cluster.replica_count);
-        assert(quorums.view_change > core_replicas - core_recovering_head);
-        return true;
+        return quorums.view_change > core_replicas - core_recovering_head;
     }
 
     // Returns a header for a prepare which can't be repaired by the core due to storage faults.

@@ -7,10 +7,6 @@ sidebar_position: 1
 An `Account` is a record storing the cumulative effect of committed
 [transfers](./transfers.md).
 
-TigerBeetle uses the same data structures internally and
-externally. This means that sometimes you need to set temporary values
-for fields that TigerBeetle, not you (the user), are responsible.
-
 ### Updates
 
 Account fields *cannot be changed by the user* after
@@ -28,6 +24,9 @@ Constraints:
 * Type is 128-bit unsigned integer (16 bytes)
 * Must not be zero or `2^128 - 1` (the highest 128-bit unsigned integer)
 * Must not conflict with another account
+
+See the [`id` section in the data modeling doc](../design/data-modeling.md#id) for more
+recommendations on choosing an ID scheme.
 
 ### `debits_pending`
 
@@ -121,16 +120,10 @@ Constraints:
 ### `ledger`
 
 This is an identifier that partitions the sets of accounts that can
-transact with each other. Put another way, money cannot transfer
-between two accounts with different `ledger` values. See:
-[`accounts_must_have_the_same_ledger`](./operations/create_transfers.md#accounts_must_have_the_same_ledger).
+transact with each other.
 
-[Currency exchange](../recipes/currency-exchange.md) is implemented with two or more linked
-transfers.
-
-In a typical use case:
-* Map each asset or currency tracked within the database to a distinct ledger. And,
-* Tag each account with the `ledger` indicating the currency in which the balance is denominated.
+See [data modeling](../design/data-modeling.md#ledger) for more details
+about how to think about setting up your ledgers.
 
 Constraints:
 * Type is 32-bit unsigned integer (4 bytes)
@@ -166,7 +159,8 @@ account in the batch, to create a chain of accounts, of arbitrary
 length, which all succeed or fail in creation together. The tail of a
 chain is denoted by the first account without this flag. The last
 account in a batch may therefore never have `flags.linked` set as
-this would leave a chain open-ended (see `linked_event_chain_open`).
+this would leave a chain open-ended (see
+[`linked_event_chain_open`](./operations/create_accounts.md#linked_event_chain_open)).
 
 Multiple chains or individual accounts may coexist within a batch to
 succeed or fail independently. Accounts within a chain are executed
@@ -178,9 +172,13 @@ unique error result. Other accounts in the chain will have their error
 result set to
 [`linked_event_failed`](./operations/create_accounts.md#linked_event_failed).
 
-After the link has executed, the association of each event is lost.
-To save the association, it must be
-[encoded into the data model](../design/data-modeling.md).
+
+After the chain of account operations has executed, the fact that they were
+linked will not be saved.
+To save the association between accounts, it must be
+[encoded into the data model](../design/data-modeling.md), for example by
+adding an ID to one of the [user data](../design/data-modeling.md#user_data)
+fields.
 
 #### `flags.debits_must_not_exceed_credits`
 
@@ -210,17 +208,12 @@ UNIX epoch.
 It is set by TigerBeetle to the moment the account arrives at
 the cluster.
 
-Additionally, all timestamps are unique, immutable and [totally
-ordered](http://book.mixu.net/distsys/time.html). So an account that
-is created before another account is guaranteed to have an earlier
-timestamp. In other systems this is also called a "physical"
-timestamp, "ingestion" timestamp, "record" timestamp, or "system"
-timestamp.
+You can read more about [Time in TigerBeetle](../design/time.md).
 
 Constraints:
 
-* Type is 64-bit unsigned integer (8 bytes)
-* User sets to zero on creation
+- Type is 64-bit unsigned integer (8 bytes)
+- Must be set to `0` by the user when the `Account` is created
 
 ## Internals
 
